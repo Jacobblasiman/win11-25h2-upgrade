@@ -21,8 +21,8 @@
          the media's edition, language, architecture and build match this machine
       6. Suspends BitLocker for 3 reboots
       7. Runs setup.exe /auto upgrade /quiet /noreboot and shows progress
-      8. On success: warns logged-on users, then reboots after a countdown (the tech can
-         reboot now or cancel). On failure: decodes the error, collects logs, runs SetupDiag,
+      8. On success: leaves the upgrade staged; it finishes at the next reboot (no reboot
+         is scheduled). On failure: decodes the error, collects logs, runs SetupDiag,
          and resumes BitLocker.
 
     Run it in Windows PowerShell 5.1 (not PowerShell 7) as Administrator:
@@ -48,9 +48,6 @@
     Setup /DynamicUpdate mode. Default: Disable (no internet or WU dependency during setup).
     'Enable' pulls the latest setup/compat fixes and LCU if the machine can reach Microsoft.
 
-.PARAMETER RebootDelayMinutes
-    How long users are warned before the reboot. Default: 10
-
 .PARAMETER SetupTimeoutMinutes
     How long to wait for setup's first (down-level) phase before giving up monitoring. Default: 240
 
@@ -65,7 +62,7 @@
 
 .NOTES
     Exit codes:
-       0  Success: upgrade staged and reboot scheduled, OR already on 25H2+, OR compat scan passed
+       0  Success: upgrade staged (reboot to finish), OR already on 25H2+, OR compat scan passed
        1  Unexpected error
       11  Unsupported OS/edition/architecture
       12  Hardware does not meet Windows 11 24H2+ requirements
@@ -92,9 +89,6 @@ param(
 
     [ValidateSet('Disable', 'Enable', 'NoDrivers', 'NoLCU', 'NoDriversNoLCU')]
     [string]$DynamicUpdate = 'Disable',
-
-    [ValidateRange(1, 240)]
-    [int]$RebootDelayMinutes = 10,
 
     [ValidateRange(30, 720)]
     [int]$SetupTimeoutMinutes = 240,
@@ -340,7 +334,7 @@ Write-Log "Log file: $LogFile"
 #endregion
 
 #region ---------- 1. OS / edition / architecture ----------
-Write-Log '1/8  Checking current OS' 'STEP'
+Write-Log '1/7  Checking current OS' 'STEP'
 $cv       = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $curBuild = [int]$cv.CurrentBuildNumber
 $curUBR   = $cv.UBR
@@ -371,7 +365,7 @@ if ($running) { Exit-Script 18 "Windows Setup is already running (PID $($running
 #endregion
 
 #region ---------- 2. Pending reboot ----------
-Write-Log '2/8  Checking for pending reboot' 'STEP'
+Write-Log '2/7  Checking for pending reboot' 'STEP'
 $pending = @(Get-PendingRebootReasons)
 if ($pending.Count -gt 0) {
     $pending | ForEach-Object { Write-Log "Pending: $_" 'WARN' }
@@ -389,7 +383,7 @@ Write-Log 'No pending reboot.' 'OK'
 #endregion
 
 #region ---------- 3. Hardware ----------
-Write-Log '3/8  Checking Windows 11 24H2+ hardware requirements' 'STEP'
+Write-Log '3/7  Checking Windows 11 24H2+ hardware requirements' 'STEP'
 $hwFail = @()
 
 # TPM 2.0
@@ -445,7 +439,7 @@ try {
 #endregion
 
 #region ---------- 4. Pre-flight remediation ----------
-Write-Log '4/8  Pre-flight checks and fixes' 'STEP'
+Write-Log '4/7  Pre-flight checks and fixes' 'STEP'
 
 # 4a. Stale upgrade folders from earlier failed attempts are a common cause of failure
 foreach ($f in @($BTFolder, $WSFolder)) { Remove-FolderHard $f }
@@ -544,7 +538,7 @@ if ($s1) {
 #endregion
 
 #region ---------- 5. Media ----------
-Write-Log '5/8  Preparing install media' 'STEP'
+Write-Log '5/7  Preparing install media' 'STEP'
 $src = $IsoPath
 
 if ($ShareCredential -and $IsoPath -like '\\*') {
@@ -654,7 +648,7 @@ Write-Log 'Media matches this machine.' 'OK'
 #region ---------- 6. Compat scan only (optional) ----------
 $setupLogCopy = Join-Path $LogDir "SetupCopyLogs-$Stamp"
 if ($CompatScanOnly) {
-    Write-Log '6/8  Running compatibility scan only (no changes)' 'STEP'
+    Write-Log '6/7  Running compatibility scan only (no changes)' 'STEP'
     $scanArgs = "/Auto Upgrade /Quiet /EULA Accept /Compat ScanOnly /DynamicUpdate $DynamicUpdate /Telemetry Disable /CopyLogs `"$setupLogCopy`""
     Write-Log "setup.exe $scanArgs"
     Write-Log 'The scan usually takes 5-20 minutes...'
@@ -669,12 +663,12 @@ if ($CompatScanOnly) {
 #endregion
 
 #region ---------- 7. Run the upgrade ----------
-Write-Log '6/8  Ready to upgrade' 'STEP'
+Write-Log '6/7  Ready to upgrade' 'STEP'
 Write-Log "  $env:COMPUTERNAME : build $curBuild ($curVer) $edition  ->  build $($image.Version) $($image.ImageName)"
-Write-Log "  Setup phase 1 runs in the background (30-90 min). Users can keep working. Reboot comes after, with a $RebootDelayMinutes-minute warning."
+Write-Log "  Setup phase 1 runs in the background (30-90 min). Users can keep working. The script does not reboot; the upgrade finishes at the next reboot."
 if (-not (Confirm-Continue 'Start the upgrade now?')) { Exit-Script 17 'Canceled by tech before setup started.' }
 
-Write-Log '7/8  Suspending BitLocker and starting setup' 'STEP'
+Write-Log '7/7  Suspending BitLocker and starting setup' 'STEP'
 Suspend-OSBitLocker
 
 # Post-upgrade and rollback hooks (run as SYSTEM by setup) write a result marker for the tech
@@ -745,54 +739,8 @@ if ($code -ne 0 -and $code -ne 3) {
 if ($null -ne $finalPct -and [int]$finalPct -lt 100) {
     Write-Log "Setup returned success but reported progress $finalPct%. Check $BTFolder\Sources\Panther\setupact.log if the reboot doesn't upgrade the machine." 'WARN'
 }
-Write-Log 'Phase 1 complete. The upgrade is staged and finishes on reboot.' 'OK'
-#endregion
-
-#region ---------- 8. Warn users, then reboot ----------
-Write-Log '8/8  Scheduling reboot' 'STEP'
 Invoke-Cleanup   # dismount ISO; setup has already copied everything to $WINDOWS.~BT
-
-$sec = $RebootDelayMinutes * 60
-$msgText = "IT is upgrading Windows on this computer. It will RESTART in $RebootDelayMinutes minute(s). Save your work now. The restart will take 30-60 minutes; do not power off the computer."
-try { Invoke-Native msg.exe @('*', "/TIME:$sec", $msgText) | Out-Null } catch { }
-$sd = Invoke-Native shutdown.exe @('/r', '/t', "$sec", '/d', 'p:2:3', '/c', $msgText.Substring(0, [math]::Min(500, $msgText.Length)))
-if ($sd.ExitCode -ne 0) {
-    Write-Log "shutdown.exe returned $($sd.ExitCode). Reboot manually to finish the upgrade." 'WARN'
-    Exit-Script 0 'Upgrade staged. Reboot manually to finish.'
-}
-Write-Log "Reboot scheduled in $RebootDelayMinutes minute(s). Logged-on users were notified." 'OK'
-Write-Log "After the reboot, check $postLog for SUCCESS/ROLLBACK, and run 'winver' to confirm."
-
-# Tech console countdown: R = reboot now, C = cancel the reboot (upgrade stays staged)
-$deadline = (Get-Date).AddSeconds($sec)
-try {
-    Write-Host ''
-    Write-Host 'Press R to reboot now, or C to cancel the scheduled reboot. Closing this window keeps the reboot scheduled.' -ForegroundColor Cyan
-    while ((Get-Date) -lt $deadline) {
-        $left = $deadline - (Get-Date)
-        Write-Host ("`r  Rebooting in {0:mm\:ss} " -f $left) -NoNewline -ForegroundColor Yellow
-        if ([Console]::KeyAvailable) {
-            $k = [Console]::ReadKey($true).Key
-            if ($k -eq 'R') {
-                Write-Host ''
-                Write-Log 'Tech chose to reboot now.'
-                Invoke-Native shutdown.exe @('/a') | Out-Null
-                if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { } }
-                Invoke-Native shutdown.exe @('/r', '/t', '0', '/d', 'p:2:3', '/c', 'Windows feature upgrade') | Out-Null
-                exit 0
-            }
-            if ($k -eq 'C') {
-                Write-Host ''
-                Invoke-Native shutdown.exe @('/a') | Out-Null
-                try { Invoke-Native msg.exe @('*', 'The scheduled restart was canceled by IT.') | Out-Null } catch { }
-                Exit-Script 0 'Reboot canceled by the tech. The upgrade is STAGED and finishes at the next reboot.'
-            }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-} catch {
-    # Host without an interactive console (ISE, remoting): the reboot stays scheduled
-}
-Write-Host ''
-Exit-Script 0 'Upgrade staged and reboot started.'
+Write-Log 'Phase 1 complete. The upgrade is STAGED. No reboot was scheduled.' 'OK'
+Write-Log "The upgrade finishes at the next reboot (30-60 min, do not power off). Afterwards, check $postLog for SUCCESS/ROLLBACK and run 'winver' to confirm."
+Exit-Script 0 'Upgrade staged. Reboot when convenient to finish.'
 #endregion
