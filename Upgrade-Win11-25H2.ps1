@@ -16,15 +16,12 @@
       3. Checks Windows 11 24H2+ hardware requirements (TPM 2.0, UEFI/Secure Boot, SSE4.2/POPCNT, RAM)
       4. Fixes problems it finds: removes stale upgrade folders, frees disk space,
          repairs the component store if it is flagged as corrupt, warns about known
-         causes of rollback
-      5. Copies the ISO locally (restartable), checks that its SHA256 matches the source (deletes
-         and recopies it if not), mounts it, and checks that
+         causes of rollback. Each slow fix is capped at 1 minute.
+      5. Deletes any earlier local copy, copies the media fresh, mounts it, and checks that
          the media's language, architecture and build match this machine
       6. Suspends BitLocker for 3 reboots
-      7. Runs setup.exe /auto upgrade /quiet /noreboot and shows progress
-      8. On success: warns logged-on users, then reboots after a countdown (the tech can
-         reboot now or cancel). On failure: decodes the error, collects logs, runs SetupDiag,
-         and resumes BitLocker.
+      7. Starts setup.exe with no arguments (the interactive Windows Setup UI). The tech
+         finishes the upgrade in the UI, and setup handles the restart.
 
     Run it in Windows PowerShell 5.1 (not PowerShell 7) as Administrator:
         powershell.exe -ExecutionPolicy Bypass -File .\Upgrade-Win11-25H2.ps1 -IsoPath "\\server\share\Win11_25H2_Business_x64.iso"
@@ -33,31 +30,21 @@
     UNC or local path to the Windows 11 25H2 Business Editions ISO, OR a folder that contains
     extracted media (setup.exe at its root).
 
-.PARAMETER IsoSha256
-    Optional SHA256 hash of the ISO. The local copy is always checked against the source ISO's hash;
-    if you provide this, the source ISO is also checked against it before copying.
-
 .PARAMETER ShareCredential
     Optional credential for the file share, for when the tech's account can't read it.
 
 .PARAMETER WorkingDirectory
-    Local folder for the cached media, logs and post-upgrade scripts. Default: C:\ProgramData\Win11Upgrade
+    Local folder for the media copy and logs. Default: C:\ProgramData\Win11Upgrade
 
 .PARAMETER MinFreeSpaceGB
     Free space required on the system drive, not counting the local ISO copy. Default: 30
 
 .PARAMETER DynamicUpdate
-    Setup /DynamicUpdate mode. Default: Disable (no internet or WU dependency during setup).
-    'Enable' pulls the latest setup/compat fixes and LCU if the machine can reach Microsoft.
-
-.PARAMETER RebootDelayMinutes
-    How long users are warned before the reboot. Default: 10
-
-.PARAMETER SetupTimeoutMinutes
-    How long to wait for setup's first (down-level) phase before giving up monitoring. Default: 240
+    Setup /DynamicUpdate mode for -CompatScanOnly. Default: Disable (no internet or WU dependency).
+    'Enable' pulls the latest setup/compat fixes if the machine can reach Microsoft.
 
 .PARAMETER DeepHealthScan
-    Run DISM /ScanHealth (slow, 5-20 min) instead of the quick /CheckHealth.
+    Run DISM /ScanHealth instead of the quick /CheckHealth (capped at 1 min, like the other step 4 checks).
 
 .PARAMETER CompatScanOnly
     Run only setup's compatibility scan (/Compat ScanOnly), report the result, and exit. Changes nothing.
@@ -67,14 +54,14 @@
 
 .NOTES
     Exit codes:
-       0  Success: upgrade staged and reboot scheduled, OR already on 25H2+, OR compat scan passed
+       0  Windows Setup was started and has closed, OR already on 25H2+, OR compat scan passed
        1  Unexpected error
       11  Unsupported architecture
       12  Hardware does not meet Windows 11 24H2+ requirements
       13  Not enough disk space after cleanup
       14  Reboot pending, reboot and run again
-      15  Media problem (copy, hash, mount, language, architecture or build mismatch)
-      16  Setup failed or compat scan found blockers (see logs)
+      15  Media problem (copy, mount, language, architecture or build mismatch)
+      16  Compat scan found blockers (see logs)
       17  Canceled by the tech
       18  Windows Setup is already running
 #>
@@ -82,8 +69,6 @@
 param(
     [Parameter(Mandatory = $true, HelpMessage = 'UNC/local path to the Windows 11 25H2 ISO or extracted media folder')]
     [string]$IsoPath,
-
-    [string]$IsoSha256,
 
     [System.Management.Automation.PSCredential]$ShareCredential,
 
@@ -94,12 +79,6 @@ param(
 
     [ValidateSet('Disable', 'Enable', 'NoDrivers', 'NoLCU', 'NoDriversNoLCU')]
     [string]$DynamicUpdate = 'Disable',
-
-    [ValidateRange(1, 240)]
-    [int]$RebootDelayMinutes = 10,
-
-    [ValidateRange(30, 720)]
-    [int]$SetupTimeoutMinutes = 240,
 
     [switch]$DeepHealthScan,
     [switch]$CompatScanOnly,
@@ -119,7 +98,6 @@ $BTFolder   = Join-Path $SysDrive '$WINDOWS.~BT'
 $WSFolder   = Join-Path $SysDrive '$Windows.~WS'
 $MediaDir   = Join-Path $WorkingDirectory 'Media'
 $LogDir     = Join-Path $WorkingDirectory 'Logs'
-$ScriptDir  = Join-Path $WorkingDirectory 'Scripts'
 $Stamp      = Get-Date -Format 'yyyyMMdd-HHmmss'
 $LogFile    = Join-Path $LogDir "Upgrade-$Stamp.log"
 
@@ -161,7 +139,7 @@ function Invoke-NativeWithTimeout {
         while (-not $p.WaitForExit(2000)) {
             if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
                 Invoke-Native taskkill.exe @('/PID', "$($p.Id)", '/T', '/F') | Out-Null
-                Write-Log "$Activity did not finish within $TimeoutMinutes minutes. Stopped it and continuing." 'WARN'
+                Write-Log "$Activity did not finish within $TimeoutMinutes minute(s). Stopped it and continuing." 'WARN'
                 return [pscustomobject]@{ ExitCode = $null; TimedOut = $true }
             }
             Write-Progress -Id 5 -Activity $Activity -Status ('Running, {0:hh\:mm\:ss} elapsed (limit {1} min)' -f $sw.Elapsed, $TimeoutMinutes)
@@ -190,7 +168,7 @@ function Get-ComponentStoreState {
             if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
                 Stop-Job -Job $job
                 Get-Process -Name 'DismHost' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                Write-Log "DISM $Mode did not finish within $TimeoutMinutes minutes. Stopped it and continuing." 'WARN'
+                Write-Log "DISM $Mode did not finish within $TimeoutMinutes minute(s). Stopped it and continuing." 'WARN'
                 return $null
             }
             Write-Progress -Id 5 -Activity "DISM $Mode" -Status ('Running, {0:hh\:mm\:ss} elapsed (limit {1} min)' -f $sw.Elapsed, $TimeoutMinutes)
@@ -203,8 +181,8 @@ function Get-ComponentStoreState {
 }
 
 function Copy-FileWithProgress {
-    # Chunked copy with a progress bar (MB/s, ETA). Resumes a partial destination file and
-    # retries on network errors by reopening at the last good offset.
+    # Chunked copy with a progress bar (MB/s, ETA). Always starts fresh (any existing destination
+    # is deleted); within a run, network errors are retried by reopening at the last good offset.
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination,
@@ -216,17 +194,7 @@ function Copy-FileWithProgress {
     $total  = (Get-Item -LiteralPath $Source).Length
     $buffer = New-Object byte[] (4MB)
     $done   = 0L
-    if (Test-Path -LiteralPath $Destination) {
-        $existing = (Get-Item -LiteralPath $Destination).Length
-        if ($existing -eq $total) { return }
-        if ($existing -lt $total) {
-            # The tail of an interrupted copy can be unwritten (zeros) or a partial chunk if the
-            # script or machine died mid-write, so back up and recopy the last 64 MB.
-            $done = [math]::Max(0L, $existing - 64MB)
-            Write-Log "Resuming copy at $([math]::Round($done/1MB)) MB"
-        }
-        else { Remove-Item -LiteralPath $Destination -Force }
-    }
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $startBytes = $done
     $lastUpdate = 0
@@ -271,75 +239,6 @@ function Copy-FileWithProgress {
     Write-Progress -Id $ProgressId -Activity $Activity -Completed
 }
 
-function Get-FileSha256 {
-    # SHA256 with a progress bar (Get-FileHash shows none, and hashing a multi-GB ISO on a share takes a while)
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [string]$Activity = 'Computing SHA256',
-        [int]$ProgressId = 1,
-        [int]$ParentId = -1
-    )
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $fs  = [IO.File]::Open($Path, 'Open', 'Read', 'Read')
-    try {
-        $total  = $fs.Length
-        $buffer = New-Object byte[] (4MB)
-        $done   = 0L
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        $lastUpdate = -1000
-        while (($read = $fs.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
-            $done += $read
-            if ($sw.ElapsedMilliseconds - $lastUpdate -ge 500) {
-                $lastUpdate = $sw.ElapsedMilliseconds
-                $rate = $done / [math]::Max($sw.Elapsed.TotalSeconds, 0.1)
-                $p = @{
-                    Id               = $ProgressId
-                    Activity         = $Activity
-                    Status           = ('{0:N0} / {1:N0} MB  ({2:N1} MB/s)' -f ($done/1MB), ($total/1MB), ($rate/1MB))
-                    PercentComplete  = [int](($done / [double][math]::Max($total, 1)) * 100)
-                    CurrentOperation = (Split-Path $Path -Leaf)
-                }
-                if ($ParentId -ge 0) { $p.ParentId = $ParentId }
-                Write-Progress @p
-            }
-        }
-        [void]$sha.TransformFinalBlock($buffer, 0, 0)
-        return ([BitConverter]::ToString($sha.Hash) -replace '-', '')
-    } finally {
-        $fs.Dispose(); $sha.Dispose()
-        Write-Progress -Id $ProgressId -Activity $Activity -Completed
-    }
-}
-
-function Copy-VerifiedFile {
-    # Copies (or resumes) Source to Destination, then compares the SHA256 of the clone with the
-    # source. On a mismatch the clone is deleted and copied again from scratch.
-    param(
-        [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Destination,
-        [string]$SourceHash,
-        [string]$Activity = 'Copying install media',
-        [int]$ProgressId = 1,
-        [int]$ParentId = -1,
-        [int]$MaxAttempts = 3
-    )
-    $name = Split-Path $Source -Leaf
-    if (-not $SourceHash) {
-        Write-Log "Hashing source $name..."
-        $SourceHash = Get-FileSha256 -Path $Source -Activity "Hashing source $name" -ProgressId $ProgressId -ParentId $ParentId
-    }
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        Copy-FileWithProgress -Source $Source -Destination $Destination -Activity $Activity -ProgressId $ProgressId -ParentId $ParentId
-        Write-Log "Verifying local copy of $name..."
-        $destHash = Get-FileSha256 -Path $Destination -Activity "Verifying $name" -ProgressId $ProgressId -ParentId $ParentId
-        if ($destHash -eq $SourceHash) { Write-Log "$name matches the source (SHA256 $destHash)" 'OK'; return }
-        Write-Log "Local copy of $name does not match the source (source $SourceHash, local $destHash). Deleting it and copying again ($attempt/$MaxAttempts)." 'WARN'
-        Remove-Item -LiteralPath $Destination -Force
-    }
-    throw "Local copy of $name still did not match the source after $MaxAttempts copies"
-}
-
 function Copy-FolderWithProgress {
     param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination)
     $files = @(Get-ChildItem -LiteralPath $Source -Recurse -File -Force)
@@ -353,8 +252,8 @@ function Copy-FolderWithProgress {
         New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
         Write-Progress -Id 1 -Activity 'Copying extracted media' -Status ('File {0} of {1}  ({2:N0} / {3:N0} MB)' -f $i, $files.Count, ($done/1MB), ($total/1MB)) -PercentComplete ([int](($done / [double][math]::Max($total,1)) * 100))
         if ($f.Length -gt 50MB) {
-            Copy-VerifiedFile -Source $f.FullName -Destination $dest -Activity $rel -ProgressId 2 -ParentId 1
-        } elseif (-not (Test-Path -LiteralPath $dest) -or (Get-Item -LiteralPath $dest).Length -ne $f.Length) {
+            Copy-FileWithProgress -Source $f.FullName -Destination $dest -Activity $rel -ProgressId 2 -ParentId 1
+        } else {
             Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
         }
         $done += $f.Length
@@ -433,12 +332,12 @@ function Remove-FolderHard([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Write-Log "Removing $Path"
     # Plain delete first. Taking ownership of every file is slow on a large folder, so only do it if needed.
-    Invoke-NativeWithTimeout cmd.exe "/c rd /s /q `"$Path`"" -TimeoutMinutes 15 -Activity "Removing $Path" | Out-Null
+    Invoke-NativeWithTimeout cmd.exe "/c rd /s /q `"$Path`"" -TimeoutMinutes 1 -Activity "Removing $Path" | Out-Null
     if (Test-Path -LiteralPath $Path) {
         Write-Log 'Some files are protected. Taking ownership and retrying...'
-        Invoke-NativeWithTimeout takeown.exe "/F `"$Path`" /R /A /D Y" -TimeoutMinutes 20 -Activity "Taking ownership of $Path" | Out-Null
-        Invoke-NativeWithTimeout icacls.exe "`"$Path`" /grant *S-1-5-32-544:F /T /C /Q" -TimeoutMinutes 20 -Activity "Granting access to $Path" | Out-Null
-        Invoke-NativeWithTimeout cmd.exe "/c rd /s /q `"$Path`"" -TimeoutMinutes 15 -Activity "Removing $Path" | Out-Null
+        Invoke-NativeWithTimeout takeown.exe "/F `"$Path`" /R /A /D Y" -TimeoutMinutes 1 -Activity "Taking ownership of $Path" | Out-Null
+        Invoke-NativeWithTimeout icacls.exe "`"$Path`" /grant *S-1-5-32-544:F /T /C /Q" -TimeoutMinutes 1 -Activity "Granting access to $Path" | Out-Null
+        Invoke-NativeWithTimeout cmd.exe "/c rd /s /q `"$Path`"" -TimeoutMinutes 1 -Activity "Removing $Path" | Out-Null
     }
     if (Test-Path -LiteralPath $Path) { Write-Log "Could not fully remove $Path (files in use?)" 'WARN' } else { Write-Log "Removed $Path" 'OK' }
 }
@@ -544,7 +443,7 @@ Add-Type -Namespace Win11Upg -Name Native -MemberDefinition @'
 #endregion
 
 #region ---------- Init ----------
-foreach ($d in @($WorkingDirectory, $MediaDir, $LogDir, $ScriptDir)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+foreach ($d in @($WorkingDirectory, $MediaDir, $LogDir)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 try { Start-Transcript -Path (Join-Path $LogDir "Transcript-$Stamp.txt") -Force | Out-Null; $script:TranscriptOn = $true } catch { }
 
 # Keep the machine awake while the script runs (ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
@@ -563,7 +462,7 @@ Write-Log "Log file: $LogFile"
 #endregion
 
 #region ---------- 1. OS / edition / architecture ----------
-Write-Log '1/8  Checking current OS' 'STEP'
+Write-Log '1/7  Checking current OS' 'STEP'
 $cv       = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $curBuild = [int]$cv.CurrentBuildNumber
 $curUBR   = $cv.UBR
@@ -590,7 +489,7 @@ if ($running) { Exit-Script 18 "Windows Setup is already running (PID $($running
 #endregion
 
 #region ---------- 2. Pending reboot ----------
-Write-Log '2/8  Checking for pending reboot' 'STEP'
+Write-Log '2/7  Checking for pending reboot' 'STEP'
 $pending = @(Get-PendingRebootReasons)
 if ($pending.Count -gt 0) {
     $pending | ForEach-Object { Write-Log "Pending: $_" 'WARN' }
@@ -608,7 +507,7 @@ Write-Log 'No pending reboot.' 'OK'
 #endregion
 
 #region ---------- 3. Hardware ----------
-Write-Log '3/8  Checking Windows 11 24H2+ hardware requirements' 'STEP'
+Write-Log '3/7  Checking Windows 11 24H2+ hardware requirements' 'STEP'
 $hwFail = @()
 
 # TPM 2.0
@@ -664,17 +563,23 @@ try {
 #endregion
 
 #region ---------- 4. Pre-flight remediation ----------
-Write-Log '4/8  Pre-flight checks and fixes' 'STEP'
+Write-Log '4/7  Pre-flight checks and fixes' 'STEP'
 
-# 4a. Stale upgrade folders from earlier failed attempts are a common cause of failure
+# 4a. Stale upgrade folders from earlier failed attempts are a common cause of failure. Old media
+#     copies are deleted too; step 5 always copies the media fresh.
 foreach ($f in @($BTFolder, $WSFolder)) { Remove-FolderHard $f }
+Get-ChildItem -LiteralPath $MediaDir -Filter '*.iso' -File -ErrorAction SilentlyContinue | ForEach-Object {
+    try { Dismount-DiskImage -ImagePath $_.FullName -ErrorAction Stop | Out-Null } catch { }   # left mounted by an earlier run
+}
+foreach ($old in @(Get-ChildItem -LiteralPath $MediaDir -Force -ErrorAction SilentlyContinue)) {
+    Write-Log "Removing old media copy $($old.FullName)"
+    try { Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction Stop }
+    catch { Exit-Script 15 "Could not delete old media copy $($old.FullName): $($_.Exception.Message)" }
+}
 
 # 4b. Disk space
 $isoSizeGB = 8   # assumed size of the local media copy (ISO or extracted folder)
-$cachedIso = Join-Path $MediaDir (Split-Path $IsoPath -Leaf)
-if ($IsoPath -match '\.iso$' -and (Test-Path -LiteralPath $cachedIso)) {
-    $isoSizeGB = 0   # already cached from an earlier run
-} elseif ($IsoPath -match '\.iso$' -and (Test-Path -LiteralPath $IsoPath -ErrorAction SilentlyContinue)) {
+if ($IsoPath -match '\.iso$' -and (Test-Path -LiteralPath $IsoPath -ErrorAction SilentlyContinue)) {
     $isoSizeGB = [math]::Ceiling((Get-Item -LiteralPath $IsoPath).Length / 1GB)
 }
 $needGB = $MinFreeSpaceGB + $isoSizeGB
@@ -702,8 +607,8 @@ if ($freeGB -lt $needGB) {
     # Recycle bin
     try { Clear-RecycleBin -DriveLetter $SysDrive.TrimEnd(':') -Force -ErrorAction Stop } catch { }
     # WinSxS superseded components
-    Write-Log 'Running DISM /StartComponentCleanup (up to 30 min)...'
-    Invoke-NativeWithTimeout dism.exe '/Online /Cleanup-Image /StartComponentCleanup /Quiet' -TimeoutMinutes 30 -Activity 'DISM StartComponentCleanup' | Out-Null
+    Write-Log 'Running DISM /StartComponentCleanup (limit 1 min)...'
+    Invoke-NativeWithTimeout dism.exe '/Online /Cleanup-Image /StartComponentCleanup /Quiet' -TimeoutMinutes 1 -Activity 'DISM StartComponentCleanup' | Out-Null
     $freeGB = Get-FreeGB
     Write-Log "Free space after cleanup: $freeGB GB"
     if ($freeGB -lt $needGB) {
@@ -717,23 +622,23 @@ Write-Log 'Disk space OK.' 'OK'
 #     produces a warning, but a quick repair helps avoid migration problems.
 try {
     if ($DeepHealthScan) {
-        Write-Log 'Running DISM ScanHealth (5-20 min, limit 30)...'
-        $state = Get-ComponentStoreState -Mode ScanHealth -TimeoutMinutes 30
+        Write-Log 'Running DISM ScanHealth (limit 1 min)...'
+        $state = Get-ComponentStoreState -Mode ScanHealth -TimeoutMinutes 1
     } else {
         Write-Log 'Running DISM CheckHealth...'
-        $state = Get-ComponentStoreState -Mode CheckHealth -TimeoutMinutes 10
+        $state = Get-ComponentStoreState -Mode CheckHealth -TimeoutMinutes 1
     }
     if ($null -eq $state) { throw 'the health check timed out' }
     Write-Log "Component store state: $state"
     if ($state -ne 'Healthy') {
         Write-Log 'Component store is flagged. Running DISM RestoreHealth + SFC...' 'WARN'
         try {
-            Write-Log 'Running DISM RestoreHealth (limit 30 min)...'
-            $r = Get-ComponentStoreState -Mode RestoreHealth -TimeoutMinutes 30
+            Write-Log 'Running DISM RestoreHealth (limit 1 min)...'
+            $r = Get-ComponentStoreState -Mode RestoreHealth -TimeoutMinutes 1
             if ($null -ne $r) { Write-Log "After RestoreHealth: $r" }
         } catch { Write-Log "RestoreHealth failed ($($_.Exception.Message)). Continuing, since the media upgrade replaces the component store." 'WARN' }
-        Write-Log 'Running SFC /scannow (10-20 min, limit 30)...'
-        $sfc = Invoke-NativeWithTimeout sfc.exe '/scannow' -TimeoutMinutes 30 -Activity 'SFC /scannow'
+        Write-Log 'Running SFC /scannow (limit 1 min)...'
+        $sfc = Invoke-NativeWithTimeout sfc.exe '/scannow' -TimeoutMinutes 1 -Activity 'SFC /scannow'
         if (-not $sfc.TimedOut) { Write-Log "SFC exit code: $($sfc.ExitCode) (details in %windir%\Logs\CBS\CBS.log)" }
         $pending2 = @(Get-PendingRebootReasons)
         if ($pending2.Count -gt 0) { Exit-Script 14 'The repairs need a reboot. Reboot and run the script again.' }
@@ -772,7 +677,7 @@ if ($s1) {
 #endregion
 
 #region ---------- 5. Media ----------
-Write-Log '5/8  Preparing install media' 'STEP'
+Write-Log '5/7  Preparing install media' 'STEP'
 $src = $IsoPath
 
 if ($ShareCredential -and $IsoPath -like '\\*') {
@@ -799,37 +704,12 @@ if ((Get-Item -LiteralPath $src).PSIsContainer) {
 } else {
     $isoName  = Split-Path $src -Leaf
     $localIso = Join-Path $MediaDir $isoName
-    $srcItem  = Get-Item -LiteralPath $src
-    # A copy left mounted by an earlier run can't be rewritten or deleted
-    try { Dismount-DiskImage -ImagePath $localIso -ErrorAction Stop | Out-Null } catch { }
-
-    # Source hash, cached next to the local copy so a rerun doesn't read the whole ISO from the
-    # share again. The cache is reused only while the source's size and timestamp are unchanged.
-    $hashCache = "$localIso.source.sha256"
-    $srcKey    = '{0}|{1}' -f $srcItem.Length, $srcItem.LastWriteTimeUtc.Ticks
-    $srcHash   = $null
-    if (Test-Path -LiteralPath $hashCache) {
-        $c = (Get-Content -LiteralPath $hashCache -Raw).Trim() -split '\|'
-        if ($c.Count -eq 3 -and "$($c[0])|$($c[1])" -eq $srcKey) { $srcHash = $c[2]; Write-Log "Source SHA256 (cached): $srcHash" }
-    }
-    if (-not $srcHash) {
-        Write-Log "Hashing the source ISO ($([math]::Round($srcItem.Length/1GB,2)) GB)..."
-        try { $srcHash = Get-FileSha256 -Path $src -Activity "Hashing source $isoName" }
-        catch { Exit-Script 15 "Could not read the source ISO: $($_.Exception.Message). Run again." }
-        Set-Content -LiteralPath $hashCache -Value "$srcKey|$srcHash" -Encoding ASCII
-        Write-Log "Source SHA256: $srcHash"
-    }
-    if ($IsoSha256 -and $srcHash -ne $IsoSha256.Trim().ToUpper()) {
-        Exit-Script 15 "The source ISO does not match -IsoSha256 (expected $IsoSha256, got $srcHash). The ISO on the share is wrong or damaged."
-    }
-
-    if ((Test-Path -LiteralPath $localIso) -and (Get-Item -LiteralPath $localIso).Length -eq $srcItem.Length) {
-        Write-Log "Local ISO copy already exists ($localIso). Checking it against the source."
-    } else {
-        Write-Log "Copying $isoName ($([math]::Round($srcItem.Length/1GB,2)) GB) to $MediaDir (resumable)..."
-    }
-    try { Copy-VerifiedFile -Source $src -Destination $localIso -SourceHash $srcHash -Activity "Copying $isoName" }
-    catch { Exit-Script 15 "ISO copy failed: $($_.Exception.Message). Run again to resume." }
+    $srcSize  = (Get-Item -LiteralPath $src).Length
+    Write-Log "Copying $isoName ($([math]::Round($srcSize/1GB,2)) GB) to $MediaDir ..."
+    try { Copy-FileWithProgress -Source $src -Destination $localIso -Activity "Copying $isoName" }
+    catch { Exit-Script 15 "ISO copy failed: $($_.Exception.Message). Run again." }
+    if ((Get-Item -LiteralPath $localIso).Length -ne $srcSize) { Exit-Script 15 'ISO copy is incomplete. Run again.' }
+    Write-Log 'ISO copied.' 'OK'
 
     # Mount; fall back to 7-Zip extraction if mounting is broken or blocked
     try {
@@ -898,7 +778,7 @@ Write-Log 'Media matches this machine.' 'OK'
 #region ---------- 6. Compat scan only (optional) ----------
 $setupLogCopy = Join-Path $LogDir "SetupCopyLogs-$Stamp"
 if ($CompatScanOnly) {
-    Write-Log '6/8  Running compatibility scan only (no changes)' 'STEP'
+    Write-Log '6/7  Running compatibility scan only (no changes)' 'STEP'
     $scanArgs = "/Auto Upgrade /Quiet /EULA Accept /Compat ScanOnly /DynamicUpdate $DynamicUpdate /Telemetry Disable /CopyLogs `"$setupLogCopy`""
     Write-Log "setup.exe $scanArgs"
     Write-Log 'The scan usually takes 5-20 minutes...'
@@ -913,130 +793,18 @@ if ($CompatScanOnly) {
 #endregion
 
 #region ---------- 7. Run the upgrade ----------
-Write-Log '6/8  Ready to upgrade' 'STEP'
+Write-Log '6/7  Ready to upgrade' 'STEP'
 Write-Log "  $env:COMPUTERNAME : build $curBuild ($curVer) $edition  ->  build $($image.Version) $($image.ImageName)"
-Write-Log "  Setup phase 1 runs in the background (30-90 min). Users can keep working. Reboot comes after, with a $RebootDelayMinutes-minute warning."
-if (-not (Confirm-Continue 'Start the upgrade now?')) { Exit-Script 17 'Canceled by tech before setup started.' }
+Write-Log '  Windows Setup opens interactively. Finish the upgrade in the Setup window; setup restarts the computer itself.'
+if (-not (Confirm-Continue 'Start Windows Setup now?')) { Exit-Script 17 'Canceled by tech before setup started.' }
 
-Write-Log '7/8  Suspending BitLocker and starting setup' 'STEP'
+Write-Log '7/7  Suspending BitLocker and starting Windows Setup' 'STEP'
 Suspend-OSBitLocker
+Write-Log "Starting $setupExe (interactive). Leave this window open until Setup finishes."
+$proc = Start-Process -FilePath $setupExe -PassThru
 
-# Post-upgrade and rollback hooks (run as SYSTEM by setup) write a result marker for the tech
-$postLog = Join-Path $LogDir 'PostUpgradeResult.log'
-@"
-@echo off
-echo %DATE% %TIME% SUCCESS - feature update completed on %COMPUTERNAME%>> "$postLog"
-rd /s /q "$MediaDir" >nul 2>&1
-exit /b 0
-"@ | Set-Content -Path (Join-Path $ScriptDir 'SetupComplete.cmd') -Encoding ASCII
-
-@"
-@echo off
-echo %DATE% %TIME% ROLLBACK - feature update was rolled back on %COMPUTERNAME%. Check the Panther logs / run SetupDiag.>> "$postLog"
-exit /b 0
-"@ | Set-Content -Path (Join-Path $ScriptDir 'SetupRollback.cmd') -Encoding ASCII
-
-$setupArgs = @(
-    '/Auto Upgrade', '/Quiet', '/EULA Accept', '/NoReboot',
-    "/DynamicUpdate $DynamicUpdate",
-    '/Compat IgnoreWarning',
-    '/BitLocker AlwaysSuspend',
-    '/ShowOOBE None',
-    '/Telemetry Disable',
-    '/Priority Normal',
-    "/CopyLogs `"$setupLogCopy`"",
-    "/PostOOBE `"$(Join-Path $ScriptDir 'SetupComplete.cmd')`"",
-    "/PostRollback `"$(Join-Path $ScriptDir 'SetupRollback.cmd')`"",
-    '/PostRollbackContext System'
-) -join ' '
-Write-Log "setup.exe $setupArgs"
-
-$start = Get-Date
-$proc  = Start-Process -FilePath $setupExe -ArgumentList $setupArgs -PassThru
-$null  = $proc.Handle   # needed so ExitCode is available after the process exits
-$volKey = 'HKLM:\SYSTEM\Setup\MoSetup\Volatile'
-$timedOut = $false
-
-# Monitor: setup.exe starts SetupHost.exe; wait for both
-while ($true) {
-    $alive = (-not $proc.HasExited) -or (Get-Process -Name 'SetupHost' -ErrorAction SilentlyContinue)
-    if (-not $alive) { break }
-    $pct = (Get-ItemProperty $volKey -Name SetupProgress -ErrorAction SilentlyContinue).SetupProgress
-    if ($null -eq $pct) { $pct = 0 }
-    $elapsed = (Get-Date) - $start
-    Write-Progress -Activity 'Windows 11 feature upgrade (phase 1: down-level)' -Status ("{0}% complete, elapsed {1:hh\:mm\:ss}" -f $pct, $elapsed) -PercentComplete ([math]::Min([int]$pct, 100))
-    if ($elapsed.TotalMinutes -gt $SetupTimeoutMinutes) { $timedOut = $true; break }
-    Start-Sleep -Seconds 15
-}
-Write-Progress -Activity 'Windows 11 feature upgrade (phase 1: down-level)' -Completed
-
-if ($timedOut) {
-    Save-SetupLogs
-    Exit-Script 16 "Setup did not finish within $SetupTimeoutMinutes minutes. It may still be running. Check Task Manager (SetupHost.exe) and $BTFolder\Sources\Panther\setupact.log."
-}
-
-$proc.WaitForExit()
-$code = $proc.ExitCode
-$hex  = ConvertTo-HexCode $code
-$finalPct = (Get-ItemProperty $volKey -Name SetupProgress -ErrorAction SilentlyContinue).SetupProgress
-Write-Log ("Setup exited with {0} ({1}) after {2:hh\:mm\:ss}. SetupProgress={3}" -f $hex, (Get-SetupCodeMeaning $hex), ((Get-Date) - $start), $finalPct)
-
-if ($code -ne 0 -and $code -ne 3) {
-    if ($hex -eq '0xC1900208') { Get-CompatHardBlocks }
-    Save-SetupLogs
-    Exit-Script 16 "Setup FAILED with $hex. Fix the cause above and run again (the ISO copy is kept, so no new download is needed)."
-}
-if ($null -ne $finalPct -and [int]$finalPct -lt 100) {
-    Write-Log "Setup returned success but reported progress $finalPct%. Check $BTFolder\Sources\Panther\setupact.log if the reboot doesn't upgrade the machine." 'WARN'
-}
-Write-Log 'Phase 1 complete. The upgrade is staged and finishes on reboot.' 'OK'
-#endregion
-
-#region ---------- 8. Warn users, then reboot ----------
-Write-Log '8/8  Scheduling reboot' 'STEP'
-Invoke-Cleanup   # dismount ISO; setup has already copied everything to $WINDOWS.~BT
-
-$sec = $RebootDelayMinutes * 60
-$msgText = "IT is upgrading Windows on this computer. It will RESTART in $RebootDelayMinutes minute(s). Save your work now. The restart will take 30-60 minutes; do not power off the computer."
-try { Invoke-Native msg.exe @('*', "/TIME:$sec", $msgText) | Out-Null } catch { }
-$sd = Invoke-Native shutdown.exe @('/r', '/t', "$sec", '/d', 'p:2:3', '/c', $msgText.Substring(0, [math]::Min(500, $msgText.Length)))
-if ($sd.ExitCode -ne 0) {
-    Write-Log "shutdown.exe returned $($sd.ExitCode). Reboot manually to finish the upgrade." 'WARN'
-    Exit-Script 0 'Upgrade staged. Reboot manually to finish.'
-}
-Write-Log "Reboot scheduled in $RebootDelayMinutes minute(s). Logged-on users were notified." 'OK'
-Write-Log "After the reboot, check $postLog for SUCCESS/ROLLBACK, and run 'winver' to confirm."
-
-# Tech console countdown: R = reboot now, C = cancel the reboot (upgrade stays staged)
-$deadline = (Get-Date).AddSeconds($sec)
-try {
-    Write-Host ''
-    Write-Host 'Press R to reboot now, or C to cancel the scheduled reboot. Closing this window keeps the reboot scheduled.' -ForegroundColor Cyan
-    while ((Get-Date) -lt $deadline) {
-        $left = $deadline - (Get-Date)
-        Write-Host ("`r  Rebooting in {0:mm\:ss} " -f $left) -NoNewline -ForegroundColor Yellow
-        if ([Console]::KeyAvailable) {
-            $k = [Console]::ReadKey($true).Key
-            if ($k -eq 'R') {
-                Write-Host ''
-                Write-Log 'Tech chose to reboot now.'
-                Invoke-Native shutdown.exe @('/a') | Out-Null
-                if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { } }
-                Invoke-Native shutdown.exe @('/r', '/t', '0', '/d', 'p:2:3', '/c', 'Windows feature upgrade') | Out-Null
-                exit 0
-            }
-            if ($k -eq 'C') {
-                Write-Host ''
-                Invoke-Native shutdown.exe @('/a') | Out-Null
-                try { Invoke-Native msg.exe @('*', 'The scheduled restart was canceled by IT.') | Out-Null } catch { }
-                Exit-Script 0 'Reboot canceled by the tech. The upgrade is STAGED and finishes at the next reboot.'
-            }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-} catch {
-    # Host without an interactive console (ISE, remoting): the reboot stays scheduled
-}
-Write-Host ''
-Exit-Script 0 'Upgrade staged and reboot started.'
+# setup.exe hands off to SetupHost.exe; keep the media mounted until both have closed
+while (-not $proc.HasExited -or (Get-Process -Name 'SetupHost' -ErrorAction SilentlyContinue)) { Start-Sleep -Seconds 5 }
+Write-Log "Windows Setup closed. If the upgrade was canceled, BitLocker protection resumes by itself after 3 reboots, or run: manage-bde -protectors -enable $SysDrive"
+Exit-Script 0 'Done.'
 #endregion
