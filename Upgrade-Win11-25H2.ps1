@@ -11,7 +11,7 @@
     a healthy component store.
 
     Steps:
-      1. Checks the OS build, edition, architecture, and any setup that is already running
+      1. Checks the OS build, architecture, and any setup that is already running
       2. Checks for a pending reboot (setup refuses to run when one is pending)
       3. Checks Windows 11 24H2+ hardware requirements (TPM 2.0, UEFI/Secure Boot, SSE4.2/POPCNT, RAM)
       4. Fixes problems it finds: removes stale upgrade folders, frees disk space,
@@ -19,7 +19,7 @@
          causes of rollback
       5. Copies the ISO locally (restartable), checks that its SHA256 matches the source (deletes
          and recopies it if not), mounts it, and checks that
-         the media's edition, language, architecture and build match this machine
+         the media's language, architecture and build match this machine
       6. Suspends BitLocker for 3 reboots
       7. Runs setup.exe /auto upgrade /quiet /noreboot and shows progress
       8. On success: warns logged-on users, then reboots after a countdown (the tech can
@@ -69,11 +69,11 @@
     Exit codes:
        0  Success: upgrade staged and reboot scheduled, OR already on 25H2+, OR compat scan passed
        1  Unexpected error
-      11  Unsupported OS/edition/architecture
+      11  Unsupported architecture
       12  Hardware does not meet Windows 11 24H2+ requirements
       13  Not enough disk space after cleanup
       14  Reboot pending, reboot and run again
-      15  Media problem (copy, hash, mount, edition, language or build mismatch)
+      15  Media problem (copy, hash, mount, language, architecture or build mismatch)
       16  Setup failed or compat scan found blockers (see logs)
       17  Canceled by the tech
       18  Windows Setup is already running
@@ -113,7 +113,6 @@ $ProgressPreference    = 'Continue'
 #region ---------- Constants / state ----------
 $TargetMinBuild   = 26200          # 25H2 = 26200, 24H2 = 26100, 23H2 = 22631
 $ExpectedSource   = 22631          # 23H2
-$SupportedEditions = @('Enterprise', 'EnterpriseN', 'Education', 'EducationN')
 
 $SysDrive   = $env:SystemDrive
 $BTFolder   = Join-Path $SysDrive '$WINDOWS.~BT'
@@ -522,10 +521,6 @@ if ($curBuild -lt 22000) {
 } elseif ($curBuild -ne $ExpectedSource) {
     Write-Log "Source build $curBuild is not 23H2 ($ExpectedSource). A media upgrade is still supported." 'WARN'
 }
-if ($SupportedEditions -notcontains $edition) {
-    Write-Log "Edition '$edition' is not Enterprise/Education. The media must contain this edition (checked later)." 'WARN'
-    if (-not (Confirm-Continue 'Continue?')) { Exit-Script 17 'Canceled by tech.' }
-}
 if ($osArch -notin @('AMD64', 'ARM64')) { Exit-Script 11 "Unsupported architecture $osArch." }
 
 $running = Get-Process -Name 'SetupHost', 'SetupPrep' -ErrorAction SilentlyContinue
@@ -802,7 +797,11 @@ foreach ($i in (Get-WindowsImage -ImagePath $wim)) {
     Write-Log ("  Index {0}: {1} | EditionId {2} | {3} | {4}" -f $d.ImageIndex, $d.ImageName, $d.EditionId, $d.Version, (($d.Languages) -join ','))
     if ($d.EditionId -eq $edition -and -not $image) { $image = $d }
 }
-if (-not $image) { Exit-Script 15 "The media has no '$edition' image. Use the Business Editions ISO (N editions need the N ISO)." }
+if (-not $image) {
+    # Not fatal: setup does its own edition matching. Use the first image for the build/arch/language checks.
+    $image = Get-WindowsImage -ImagePath $wim -Index 1
+    Write-Log "No image in the media has EditionId '$edition'. Continuing; setup will pick the edition." 'WARN'
+}
 
 $mediaBuild = ([version]$image.Version).Build
 $archRaw    = "$($image.Architecture)"
