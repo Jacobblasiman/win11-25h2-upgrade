@@ -17,7 +17,8 @@
       4. Fixes problems it finds: removes stale upgrade folders, frees disk space,
          repairs the component store if it is flagged as corrupt, warns about known
          causes of rollback
-      5. Copies the ISO locally (restartable), verifies the hash, mounts it, and checks that
+      5. Copies the ISO locally (restartable), checks that its SHA256 matches the source (deletes
+         and recopies it if not), mounts it, and checks that
          the media's edition, language, architecture and build match this machine
       6. Suspends BitLocker for 3 reboots
       7. Runs setup.exe /auto upgrade /quiet /noreboot and shows progress
@@ -33,7 +34,8 @@
     extracted media (setup.exe at its root).
 
 .PARAMETER IsoSha256
-    Optional SHA256 hash of the ISO. If you provide it, the local copy is checked before it is used.
+    Optional SHA256 hash of the ISO. The local copy is always checked against the source ISO's hash;
+    if you provide this, the source ISO is also checked against it before copying.
 
 .PARAMETER ShareCredential
     Optional credential for the file share, for when the tech's account can't read it.
@@ -161,7 +163,12 @@ function Copy-FileWithProgress {
     if (Test-Path -LiteralPath $Destination) {
         $existing = (Get-Item -LiteralPath $Destination).Length
         if ($existing -eq $total) { return }
-        if ($existing -lt $total) { $done = $existing; Write-Log "Resuming copy at $([math]::Round($done/1MB)) MB" }
+        if ($existing -lt $total) {
+            # The tail of an interrupted copy can be unwritten (zeros) or a partial chunk if the
+            # script or machine died mid-write, so back up and recopy the last 64 MB.
+            $done = [math]::Max(0L, $existing - 64MB)
+            Write-Log "Resuming copy at $([math]::Round($done/1MB)) MB"
+        }
         else { Remove-Item -LiteralPath $Destination -Force }
     }
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -173,6 +180,7 @@ function Copy-FileWithProgress {
         try {
             $in  = [IO.File]::Open($Source, 'Open', 'Read', 'Read')
             $out = [IO.File]::Open($Destination, 'OpenOrCreate', 'Write', 'None')
+            $out.SetLength($done)   # drop anything past the last good offset
             [void]$in.Seek($done, 'Begin'); [void]$out.Seek($done, 'Begin')
             while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 $out.Write($buffer, 0, $read)
@@ -207,6 +215,75 @@ function Copy-FileWithProgress {
     Write-Progress -Id $ProgressId -Activity $Activity -Completed
 }
 
+function Get-FileSha256 {
+    # SHA256 with a progress bar (Get-FileHash shows none, and hashing a multi-GB ISO on a share takes a while)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Activity = 'Computing SHA256',
+        [int]$ProgressId = 1,
+        [int]$ParentId = -1
+    )
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $fs  = [IO.File]::Open($Path, 'Open', 'Read', 'Read')
+    try {
+        $total  = $fs.Length
+        $buffer = New-Object byte[] (4MB)
+        $done   = 0L
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $lastUpdate = -1000
+        while (($read = $fs.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
+            $done += $read
+            if ($sw.ElapsedMilliseconds - $lastUpdate -ge 500) {
+                $lastUpdate = $sw.ElapsedMilliseconds
+                $rate = $done / [math]::Max($sw.Elapsed.TotalSeconds, 0.1)
+                $p = @{
+                    Id               = $ProgressId
+                    Activity         = $Activity
+                    Status           = ('{0:N0} / {1:N0} MB  ({2:N1} MB/s)' -f ($done/1MB), ($total/1MB), ($rate/1MB))
+                    PercentComplete  = [int](($done / [double][math]::Max($total, 1)) * 100)
+                    CurrentOperation = (Split-Path $Path -Leaf)
+                }
+                if ($ParentId -ge 0) { $p.ParentId = $ParentId }
+                Write-Progress @p
+            }
+        }
+        [void]$sha.TransformFinalBlock($buffer, 0, 0)
+        return ([BitConverter]::ToString($sha.Hash) -replace '-', '')
+    } finally {
+        $fs.Dispose(); $sha.Dispose()
+        Write-Progress -Id $ProgressId -Activity $Activity -Completed
+    }
+}
+
+function Copy-VerifiedFile {
+    # Copies (or resumes) Source to Destination, then compares the SHA256 of the clone with the
+    # source. On a mismatch the clone is deleted and copied again from scratch.
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [string]$SourceHash,
+        [string]$Activity = 'Copying install media',
+        [int]$ProgressId = 1,
+        [int]$ParentId = -1,
+        [int]$MaxAttempts = 3
+    )
+    $name = Split-Path $Source -Leaf
+    if (-not $SourceHash) {
+        Write-Log "Hashing source $name..."
+        $SourceHash = Get-FileSha256 -Path $Source -Activity "Hashing source $name" -ProgressId $ProgressId -ParentId $ParentId
+    }
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Copy-FileWithProgress -Source $Source -Destination $Destination -Activity $Activity -ProgressId $ProgressId -ParentId $ParentId
+        Write-Log "Verifying local copy of $name..."
+        $destHash = Get-FileSha256 -Path $Destination -Activity "Verifying $name" -ProgressId $ProgressId -ParentId $ParentId
+        if ($destHash -eq $SourceHash) { Write-Log "$name matches the source (SHA256 $destHash)" 'OK'; return }
+        Write-Log "Local copy of $name does not match the source (source $SourceHash, local $destHash). Deleting it and copying again ($attempt/$MaxAttempts)." 'WARN'
+        Remove-Item -LiteralPath $Destination -Force
+    }
+    throw "Local copy of $name still did not match the source after $MaxAttempts copies"
+}
+
 function Copy-FolderWithProgress {
     param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination)
     $files = @(Get-ChildItem -LiteralPath $Source -Recurse -File -Force)
@@ -220,7 +297,7 @@ function Copy-FolderWithProgress {
         New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
         Write-Progress -Id 1 -Activity 'Copying extracted media' -Status ('File {0} of {1}  ({2:N0} / {3:N0} MB)' -f $i, $files.Count, ($done/1MB), ($total/1MB)) -PercentComplete ([int](($done / [double][math]::Max($total,1)) * 100))
         if ($f.Length -gt 50MB) {
-            Copy-FileWithProgress -Source $f.FullName -Destination $dest -Activity $rel -ProgressId 2 -ParentId 1
+            Copy-VerifiedFile -Source $f.FullName -Destination $dest -Activity $rel -ProgressId 2 -ParentId 1
         } elseif (-not (Test-Path -LiteralPath $dest) -or (Get-Item -LiteralPath $dest).Length -ne $f.Length) {
             Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
         }
@@ -656,29 +733,40 @@ if ((Get-Item -LiteralPath $src).PSIsContainer) {
 } else {
     $isoName  = Split-Path $src -Leaf
     $localIso = Join-Path $MediaDir $isoName
-    $srcSize  = (Get-Item -LiteralPath $src).Length
-    if ((Test-Path $localIso) -and (Get-Item $localIso).Length -eq $srcSize) {
-        Write-Log "Local ISO copy already exists ($localIso). Skipping copy."
+    $srcItem  = Get-Item -LiteralPath $src
+    # A copy left mounted by an earlier run can't be rewritten or deleted
+    try { Dismount-DiskImage -ImagePath $localIso -ErrorAction Stop | Out-Null } catch { }
+
+    # Source hash, cached next to the local copy so a rerun doesn't read the whole ISO from the
+    # share again. The cache is reused only while the source's size and timestamp are unchanged.
+    $hashCache = "$localIso.source.sha256"
+    $srcKey    = '{0}|{1}' -f $srcItem.Length, $srcItem.LastWriteTimeUtc.Ticks
+    $srcHash   = $null
+    if (Test-Path -LiteralPath $hashCache) {
+        $c = (Get-Content -LiteralPath $hashCache -Raw).Trim() -split '\|'
+        if ($c.Count -eq 3 -and "$($c[0])|$($c[1])" -eq $srcKey) { $srcHash = $c[2]; Write-Log "Source SHA256 (cached): $srcHash" }
+    }
+    if (-not $srcHash) {
+        Write-Log "Hashing the source ISO ($([math]::Round($srcItem.Length/1GB,2)) GB)..."
+        try { $srcHash = Get-FileSha256 -Path $src -Activity "Hashing source $isoName" }
+        catch { Exit-Script 15 "Could not read the source ISO: $($_.Exception.Message). Run again." }
+        Set-Content -LiteralPath $hashCache -Value "$srcKey|$srcHash" -Encoding ASCII
+        Write-Log "Source SHA256: $srcHash"
+    }
+    if ($IsoSha256 -and $srcHash -ne $IsoSha256.Trim().ToUpper()) {
+        Exit-Script 15 "The source ISO does not match -IsoSha256 (expected $IsoSha256, got $srcHash). The ISO on the share is wrong or damaged."
+    }
+
+    if ((Test-Path -LiteralPath $localIso) -and (Get-Item -LiteralPath $localIso).Length -eq $srcItem.Length) {
+        Write-Log "Local ISO copy already exists ($localIso). Checking it against the source."
     } else {
-        Write-Log "Copying $isoName ($([math]::Round($srcSize/1GB,2)) GB) to $MediaDir (resumable)..."
-        try { Copy-FileWithProgress -Source $src -Destination $localIso -Activity "Copying $isoName" }
-        catch { Exit-Script 15 "ISO copy failed: $($_.Exception.Message). Run again to resume." }
-        if ((Get-Item $localIso).Length -ne $srcSize) { Exit-Script 15 'ISO copy is incomplete. Run again to resume.' }
-        Write-Log 'ISO copied.' 'OK'
+        Write-Log "Copying $isoName ($([math]::Round($srcItem.Length/1GB,2)) GB) to $MediaDir (resumable)..."
     }
-    if ($IsoSha256) {
-        Write-Log 'Verifying SHA256...'
-        $hash = (Get-FileHash -LiteralPath $localIso -Algorithm SHA256).Hash
-        if ($hash -ne $IsoSha256.Trim().ToUpper()) {
-            Remove-Item $localIso -Force -ErrorAction SilentlyContinue
-            Exit-Script 15 "Hash mismatch. Expected $IsoSha256, got $hash. The local copy was deleted."
-        }
-        Write-Log 'Hash verified.' 'OK'
-    }
+    try { Copy-VerifiedFile -Source $src -Destination $localIso -SourceHash $srcHash -Activity "Copying $isoName" }
+    catch { Exit-Script 15 "ISO copy failed: $($_.Exception.Message). Run again to resume." }
 
     # Mount; fall back to 7-Zip extraction if mounting is broken or blocked
     try {
-        try { Dismount-DiskImage -ImagePath $localIso -ErrorAction Stop | Out-Null } catch { }   # left mounted by an earlier run
         $img = Mount-DiskImage -ImagePath $localIso -StorageType ISO -PassThru -ErrorAction Stop
         $script:MountedIso = $localIso
         $letter = $null
