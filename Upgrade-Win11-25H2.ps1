@@ -21,8 +21,8 @@
          the media's edition, language, architecture and build match this machine
       6. Suspends BitLocker for 3 reboots
       7. Runs setup.exe /auto upgrade /quiet /noreboot and shows progress
-      8. On success: leaves the upgrade staged; it finishes at the next reboot (no reboot
-         is scheduled). On failure: decodes the error, collects logs, runs SetupDiag,
+      8. On success: warns logged-on users, then reboots after a countdown (the tech can
+         reboot now or cancel). On failure: decodes the error, collects logs, runs SetupDiag,
          and resumes BitLocker.
 
     Run it in Windows PowerShell 5.1 (not PowerShell 7) as Administrator:
@@ -48,6 +48,9 @@
     Setup /DynamicUpdate mode. Default: Disable (no internet or WU dependency during setup).
     'Enable' pulls the latest setup/compat fixes and LCU if the machine can reach Microsoft.
 
+.PARAMETER RebootDelayMinutes
+    How long users are warned before the reboot. Default: 10
+
 .PARAMETER SetupTimeoutMinutes
     How long to wait for setup's first (down-level) phase before giving up monitoring. Default: 240
 
@@ -62,7 +65,7 @@
 
 .NOTES
     Exit codes:
-       0  Success: upgrade staged (reboot to finish), OR already on 25H2+, OR compat scan passed
+       0  Success: upgrade staged and reboot scheduled, OR already on 25H2+, OR compat scan passed
        1  Unexpected error
       11  Unsupported OS/edition/architecture
       12  Hardware does not meet Windows 11 24H2+ requirements
@@ -89,6 +92,9 @@ param(
 
     [ValidateSet('Disable', 'Enable', 'NoDrivers', 'NoLCU', 'NoDriversNoLCU')]
     [string]$DynamicUpdate = 'Disable',
+
+    [ValidateRange(1, 240)]
+    [int]$RebootDelayMinutes = 10,
 
     [ValidateRange(30, 720)]
     [int]$SetupTimeoutMinutes = 240,
@@ -136,6 +142,91 @@ function Invoke-Native {
         $out = "Failed to run ${FilePath}: $($_.Exception.Message)"
     } finally { $ErrorActionPreference = $old }
     [pscustomobject]@{ ExitCode = $code; Output = ($out -join "`n") }
+}
+
+function Copy-FileWithProgress {
+    # Chunked copy with a progress bar (MB/s, ETA). Resumes a partial destination file and
+    # retries on network errors by reopening at the last good offset.
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [string]$Activity = 'Copying install media',
+        [int]$ProgressId = 1,
+        [int]$ParentId = -1,
+        [int]$MaxRetries = 10
+    )
+    $total  = (Get-Item -LiteralPath $Source).Length
+    $buffer = New-Object byte[] (4MB)
+    $done   = 0L
+    if (Test-Path -LiteralPath $Destination) {
+        $existing = (Get-Item -LiteralPath $Destination).Length
+        if ($existing -eq $total) { return }
+        if ($existing -lt $total) { $done = $existing; Write-Log "Resuming copy at $([math]::Round($done/1MB)) MB" }
+        else { Remove-Item -LiteralPath $Destination -Force }
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $startBytes = $done
+    $lastUpdate = 0
+    $retries = 0
+    while ($done -lt $total) {
+        $in = $null; $out = $null
+        try {
+            $in  = [IO.File]::Open($Source, 'Open', 'Read', 'Read')
+            $out = [IO.File]::Open($Destination, 'OpenOrCreate', 'Write', 'None')
+            [void]$in.Seek($done, 'Begin'); [void]$out.Seek($done, 'Begin')
+            while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $out.Write($buffer, 0, $read)
+                $done += $read
+                $retries = 0
+                if ($sw.ElapsedMilliseconds - $lastUpdate -ge 500 -or $done -eq $total) {
+                    $lastUpdate = $sw.ElapsedMilliseconds
+                    $secs = [math]::Max($sw.Elapsed.TotalSeconds, 0.1)
+                    $rate = ($done - $startBytes) / $secs
+                    $eta  = if ($rate -gt 0) { [TimeSpan]::FromSeconds([math]::Round(($total - $done) / $rate)) } else { [TimeSpan]::Zero }
+                    $p = @{
+                        Id               = $ProgressId
+                        Activity         = $Activity
+                        Status           = ('{0:N0} / {1:N0} MB  ({2:N1} MB/s, ETA {3:hh\:mm\:ss})' -f ($done/1MB), ($total/1MB), ($rate/1MB), $eta)
+                        PercentComplete  = [int](($done / [double]$total) * 100)
+                        CurrentOperation = (Split-Path $Source -Leaf)
+                    }
+                    if ($ParentId -ge 0) { $p.ParentId = $ParentId }
+                    Write-Progress @p
+                }
+            }
+        } catch {
+            $retries++
+            if ($retries -gt $MaxRetries) { throw "Copy failed after $MaxRetries retries: $($_.Exception.Message)" }
+            Write-Log "Copy interrupted at $([math]::Round($done/1MB)) MB ($($_.Exception.Message)). Retry $retries/$MaxRetries in 10s..." 'WARN'
+            Start-Sleep -Seconds 10
+        } finally {
+            if ($out) { $out.Flush(); $out.Dispose() }
+            if ($in)  { $in.Dispose() }
+        }
+    }
+    Write-Progress -Id $ProgressId -Activity $Activity -Completed
+}
+
+function Copy-FolderWithProgress {
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination)
+    $files = @(Get-ChildItem -LiteralPath $Source -Recurse -File -Force)
+    $total = ($files | Measure-Object -Property Length -Sum).Sum
+    $done  = 0L
+    $i = 0
+    foreach ($f in $files) {
+        $i++
+        $rel  = $f.FullName.Substring((Resolve-Path -LiteralPath $Source).ProviderPath.TrimEnd('\','/').Length).TrimStart('\','/')
+        $dest = Join-Path $Destination $rel
+        New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
+        Write-Progress -Id 1 -Activity 'Copying extracted media' -Status ('File {0} of {1}  ({2:N0} / {3:N0} MB)' -f $i, $files.Count, ($done/1MB), ($total/1MB)) -PercentComplete ([int](($done / [double][math]::Max($total,1)) * 100))
+        if ($f.Length -gt 50MB) {
+            Copy-FileWithProgress -Source $f.FullName -Destination $dest -Activity $rel -ProgressId 2 -ParentId 1
+        } elseif (-not (Test-Path -LiteralPath $dest) -or (Get-Item -LiteralPath $dest).Length -ne $f.Length) {
+            Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+        }
+        $done += $f.Length
+    }
+    Write-Progress -Id 1 -Activity 'Copying extracted media' -Completed
 }
 
 function Write-Log {
@@ -334,7 +425,7 @@ Write-Log "Log file: $LogFile"
 #endregion
 
 #region ---------- 1. OS / edition / architecture ----------
-Write-Log '1/7  Checking current OS' 'STEP'
+Write-Log '1/8  Checking current OS' 'STEP'
 $cv       = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $curBuild = [int]$cv.CurrentBuildNumber
 $curUBR   = $cv.UBR
@@ -365,7 +456,7 @@ if ($running) { Exit-Script 18 "Windows Setup is already running (PID $($running
 #endregion
 
 #region ---------- 2. Pending reboot ----------
-Write-Log '2/7  Checking for pending reboot' 'STEP'
+Write-Log '2/8  Checking for pending reboot' 'STEP'
 $pending = @(Get-PendingRebootReasons)
 if ($pending.Count -gt 0) {
     $pending | ForEach-Object { Write-Log "Pending: $_" 'WARN' }
@@ -383,7 +474,7 @@ Write-Log 'No pending reboot.' 'OK'
 #endregion
 
 #region ---------- 3. Hardware ----------
-Write-Log '3/7  Checking Windows 11 24H2+ hardware requirements' 'STEP'
+Write-Log '3/8  Checking Windows 11 24H2+ hardware requirements' 'STEP'
 $hwFail = @()
 
 # TPM 2.0
@@ -439,7 +530,7 @@ try {
 #endregion
 
 #region ---------- 4. Pre-flight remediation ----------
-Write-Log '4/7  Pre-flight checks and fixes' 'STEP'
+Write-Log '4/8  Pre-flight checks and fixes' 'STEP'
 
 # 4a. Stale upgrade folders from earlier failed attempts are a common cause of failure
 foreach ($f in @($BTFolder, $WSFolder)) { Remove-FolderHard $f }
@@ -538,7 +629,7 @@ if ($s1) {
 #endregion
 
 #region ---------- 5. Media ----------
-Write-Log '5/7  Preparing install media' 'STEP'
+Write-Log '5/8  Preparing install media' 'STEP'
 $src = $IsoPath
 
 if ($ShareCredential -and $IsoPath -like '\\*') {
@@ -559,8 +650,8 @@ if ((Get-Item -LiteralPath $src).PSIsContainer) {
     if (-not (Test-Path (Join-Path $src 'setup.exe'))) { Exit-Script 15 "No setup.exe in $src" }
     $localMedia = Join-Path $MediaDir 'Extracted'
     Write-Log "Copying extracted media to $localMedia ..."
-    $rc = Invoke-Native robocopy.exe @($src, $localMedia, '/E', '/Z', '/R:5', '/W:10', '/NP', '/NFL', '/NDL', '/NJH')
-    if ($rc.ExitCode -ge 8) { Exit-Script 15 "Robocopy failed copying media (code $($rc.ExitCode))." }
+    try { Copy-FolderWithProgress -Source $src -Destination $localMedia }
+    catch { Exit-Script 15 "Copying media failed: $($_.Exception.Message)" }
     $setupRoot = $localMedia
 } else {
     $isoName  = Split-Path $src -Leaf
@@ -569,10 +660,11 @@ if ((Get-Item -LiteralPath $src).PSIsContainer) {
     if ((Test-Path $localIso) -and (Get-Item $localIso).Length -eq $srcSize) {
         Write-Log "Local ISO copy already exists ($localIso). Skipping copy."
     } else {
-        Write-Log "Copying $isoName ($([math]::Round($srcSize/1GB,2)) GB) to $MediaDir (restartable)..."
-        $srcDir = Split-Path $src -Parent
-        $rc = Invoke-Native robocopy.exe @($srcDir, $MediaDir, $isoName, '/Z', '/R:5', '/W:10', '/NP', '/NFL', '/NDL', '/NJH')
-        if ($rc.ExitCode -ge 8 -or -not (Test-Path $localIso)) { Exit-Script 15 "ISO copy failed (robocopy code $($rc.ExitCode))." }
+        Write-Log "Copying $isoName ($([math]::Round($srcSize/1GB,2)) GB) to $MediaDir (resumable)..."
+        try { Copy-FileWithProgress -Source $src -Destination $localIso -Activity "Copying $isoName" }
+        catch { Exit-Script 15 "ISO copy failed: $($_.Exception.Message). Run again to resume." }
+        if ((Get-Item $localIso).Length -ne $srcSize) { Exit-Script 15 'ISO copy is incomplete. Run again to resume.' }
+        Write-Log 'ISO copied.' 'OK'
     }
     if ($IsoSha256) {
         Write-Log 'Verifying SHA256...'
@@ -648,7 +740,7 @@ Write-Log 'Media matches this machine.' 'OK'
 #region ---------- 6. Compat scan only (optional) ----------
 $setupLogCopy = Join-Path $LogDir "SetupCopyLogs-$Stamp"
 if ($CompatScanOnly) {
-    Write-Log '6/7  Running compatibility scan only (no changes)' 'STEP'
+    Write-Log '6/8  Running compatibility scan only (no changes)' 'STEP'
     $scanArgs = "/Auto Upgrade /Quiet /EULA Accept /Compat ScanOnly /DynamicUpdate $DynamicUpdate /Telemetry Disable /CopyLogs `"$setupLogCopy`""
     Write-Log "setup.exe $scanArgs"
     Write-Log 'The scan usually takes 5-20 minutes...'
@@ -663,12 +755,12 @@ if ($CompatScanOnly) {
 #endregion
 
 #region ---------- 7. Run the upgrade ----------
-Write-Log '6/7  Ready to upgrade' 'STEP'
+Write-Log '6/8  Ready to upgrade' 'STEP'
 Write-Log "  $env:COMPUTERNAME : build $curBuild ($curVer) $edition  ->  build $($image.Version) $($image.ImageName)"
-Write-Log "  Setup phase 1 runs in the background (30-90 min). Users can keep working. The script does not reboot; the upgrade finishes at the next reboot."
+Write-Log "  Setup phase 1 runs in the background (30-90 min). Users can keep working. Reboot comes after, with a $RebootDelayMinutes-minute warning."
 if (-not (Confirm-Continue 'Start the upgrade now?')) { Exit-Script 17 'Canceled by tech before setup started.' }
 
-Write-Log '7/7  Suspending BitLocker and starting setup' 'STEP'
+Write-Log '7/8  Suspending BitLocker and starting setup' 'STEP'
 Suspend-OSBitLocker
 
 # Post-upgrade and rollback hooks (run as SYSTEM by setup) write a result marker for the tech
@@ -739,8 +831,54 @@ if ($code -ne 0 -and $code -ne 3) {
 if ($null -ne $finalPct -and [int]$finalPct -lt 100) {
     Write-Log "Setup returned success but reported progress $finalPct%. Check $BTFolder\Sources\Panther\setupact.log if the reboot doesn't upgrade the machine." 'WARN'
 }
+Write-Log 'Phase 1 complete. The upgrade is staged and finishes on reboot.' 'OK'
+#endregion
+
+#region ---------- 8. Warn users, then reboot ----------
+Write-Log '8/8  Scheduling reboot' 'STEP'
 Invoke-Cleanup   # dismount ISO; setup has already copied everything to $WINDOWS.~BT
-Write-Log 'Phase 1 complete. The upgrade is STAGED. No reboot was scheduled.' 'OK'
-Write-Log "The upgrade finishes at the next reboot (30-60 min, do not power off). Afterwards, check $postLog for SUCCESS/ROLLBACK and run 'winver' to confirm."
-Exit-Script 0 'Upgrade staged. Reboot when convenient to finish.'
+
+$sec = $RebootDelayMinutes * 60
+$msgText = "IT is upgrading Windows on this computer. It will RESTART in $RebootDelayMinutes minute(s). Save your work now. The restart will take 30-60 minutes; do not power off the computer."
+try { Invoke-Native msg.exe @('*', "/TIME:$sec", $msgText) | Out-Null } catch { }
+$sd = Invoke-Native shutdown.exe @('/r', '/t', "$sec", '/d', 'p:2:3', '/c', $msgText.Substring(0, [math]::Min(500, $msgText.Length)))
+if ($sd.ExitCode -ne 0) {
+    Write-Log "shutdown.exe returned $($sd.ExitCode). Reboot manually to finish the upgrade." 'WARN'
+    Exit-Script 0 'Upgrade staged. Reboot manually to finish.'
+}
+Write-Log "Reboot scheduled in $RebootDelayMinutes minute(s). Logged-on users were notified." 'OK'
+Write-Log "After the reboot, check $postLog for SUCCESS/ROLLBACK, and run 'winver' to confirm."
+
+# Tech console countdown: R = reboot now, C = cancel the reboot (upgrade stays staged)
+$deadline = (Get-Date).AddSeconds($sec)
+try {
+    Write-Host ''
+    Write-Host 'Press R to reboot now, or C to cancel the scheduled reboot. Closing this window keeps the reboot scheduled.' -ForegroundColor Cyan
+    while ((Get-Date) -lt $deadline) {
+        $left = $deadline - (Get-Date)
+        Write-Host ("`r  Rebooting in {0:mm\:ss} " -f $left) -NoNewline -ForegroundColor Yellow
+        if ([Console]::KeyAvailable) {
+            $k = [Console]::ReadKey($true).Key
+            if ($k -eq 'R') {
+                Write-Host ''
+                Write-Log 'Tech chose to reboot now.'
+                Invoke-Native shutdown.exe @('/a') | Out-Null
+                if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { } }
+                Invoke-Native shutdown.exe @('/r', '/t', '0', '/d', 'p:2:3', '/c', 'Windows feature upgrade') | Out-Null
+                exit 0
+            }
+            if ($k -eq 'C') {
+                Write-Host ''
+                Invoke-Native shutdown.exe @('/a') | Out-Null
+                try { Invoke-Native msg.exe @('*', 'The scheduled restart was canceled by IT.') | Out-Null } catch { }
+                Exit-Script 0 'Reboot canceled by the tech. The upgrade is STAGED and finishes at the next reboot.'
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+} catch {
+    # Host without an interactive console (ISE, remoting): the reboot stays scheduled
+}
+Write-Host ''
+Exit-Script 0 'Upgrade staged and reboot started.'
 #endregion
