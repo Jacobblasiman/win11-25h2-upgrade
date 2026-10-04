@@ -145,6 +145,63 @@ function Invoke-Native {
     [pscustomobject]@{ ExitCode = $code; Output = ($out -join "`n") }
 }
 
+function Invoke-NativeWithTimeout {
+    # Runs a native exe with a time limit, so a hung DISM/SFC/takeown can't stall the script.
+    # Shows elapsed time while it runs; on timeout the process tree is killed and TimedOut is set.
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string]$Arguments,
+        [Parameter(Mandatory)][int]$TimeoutMinutes,
+        [string]$Activity = $FilePath
+    )
+    $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    $null = $p.Handle   # needed so ExitCode is available after the process exits
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while (-not $p.WaitForExit(2000)) {
+            if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
+                Invoke-Native taskkill.exe @('/PID', "$($p.Id)", '/T', '/F') | Out-Null
+                Write-Log "$Activity did not finish within $TimeoutMinutes minutes. Stopped it and continuing." 'WARN'
+                return [pscustomobject]@{ ExitCode = $null; TimedOut = $true }
+            }
+            Write-Progress -Id 5 -Activity $Activity -Status ('Running, {0:hh\:mm\:ss} elapsed (limit {1} min)' -f $sw.Elapsed, $TimeoutMinutes)
+        }
+        return [pscustomobject]@{ ExitCode = $p.ExitCode; TimedOut = $false }
+    } finally { Write-Progress -Id 5 -Activity $Activity -Completed }
+}
+
+function Get-ComponentStoreState {
+    # Runs Repair-WindowsImage in a background job so it can be time-limited (RestoreHealth can sit
+    # for a very long time waiting on WU/WSUS or another servicing operation). Returns the
+    # ImageHealthState as a string, or $null on timeout. Errors from the cmdlet are rethrown.
+    param(
+        [Parameter(Mandatory)][ValidateSet('CheckHealth', 'ScanHealth', 'RestoreHealth')][string]$Mode,
+        [Parameter(Mandatory)][int]$TimeoutMinutes
+    )
+    $job = Start-Job -ArgumentList $Mode -ScriptBlock {
+        param($m)
+        $a = @{ Online = $true; NoRestart = $true; ErrorAction = 'Stop' }
+        $a[$m] = $true
+        "$((Repair-WindowsImage @a).ImageHealthState)"
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while (-not (Wait-Job -Job $job -Timeout 2)) {
+            if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
+                Stop-Job -Job $job
+                Get-Process -Name 'DismHost' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                Write-Log "DISM $Mode did not finish within $TimeoutMinutes minutes. Stopped it and continuing." 'WARN'
+                return $null
+            }
+            Write-Progress -Id 5 -Activity "DISM $Mode" -Status ('Running, {0:hh\:mm\:ss} elapsed (limit {1} min)' -f $sw.Elapsed, $TimeoutMinutes)
+        }
+        return (Receive-Job -Job $job -ErrorAction Stop | Select-Object -Last 1)
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        Write-Progress -Id 5 -Activity "DISM $Mode" -Completed
+    }
+}
+
 function Copy-FileWithProgress {
     # Chunked copy with a progress bar (MB/s, ETA). Resumes a partial destination file and
     # retries on network errors by reopening at the last good offset.
@@ -375,9 +432,14 @@ function Get-PendingRebootReasons {
 function Remove-FolderHard([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Write-Log "Removing $Path"
-    Invoke-Native takeown.exe @('/F', $Path, '/R', '/A', '/D', 'Y') | Out-Null
-    Invoke-Native icacls.exe @($Path, '/grant', '*S-1-5-32-544:F', '/T', '/C', '/Q') | Out-Null
-    Invoke-Native cmd.exe @('/c', "rd /s /q `"$Path`"") | Out-Null
+    # Plain delete first. Taking ownership of every file is slow on a large folder, so only do it if needed.
+    Invoke-NativeWithTimeout cmd.exe "/c rd /s /q `"$Path`"" -TimeoutMinutes 15 -Activity "Removing $Path" | Out-Null
+    if (Test-Path -LiteralPath $Path) {
+        Write-Log 'Some files are protected. Taking ownership and retrying...'
+        Invoke-NativeWithTimeout takeown.exe "/F `"$Path`" /R /A /D Y" -TimeoutMinutes 20 -Activity "Taking ownership of $Path" | Out-Null
+        Invoke-NativeWithTimeout icacls.exe "`"$Path`" /grant *S-1-5-32-544:F /T /C /Q" -TimeoutMinutes 20 -Activity "Granting access to $Path" | Out-Null
+        Invoke-NativeWithTimeout cmd.exe "/c rd /s /q `"$Path`"" -TimeoutMinutes 15 -Activity "Removing $Path" | Out-Null
+    }
     if (Test-Path -LiteralPath $Path) { Write-Log "Could not fully remove $Path (files in use?)" 'WARN' } else { Write-Log "Removed $Path" 'OK' }
 }
 
@@ -626,7 +688,13 @@ if ($freeGB -lt $needGB) {
         Get-ChildItem -LiteralPath $t -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
     # Windows Update download cache
-    foreach ($svc in 'wuauserv', 'bits') { Stop-Service $svc -Force -ErrorAction SilentlyContinue }
+    foreach ($svc in 'wuauserv', 'bits') {
+        # Stop-Service -Force can wait forever on a service that won't stop
+        try {
+            Stop-Service $svc -Force -NoWait -ErrorAction Stop
+            (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+        } catch { Write-Log "Could not stop $svc within 60s. Its cache may only be partly cleared." 'WARN' }
+    }
     Get-ChildItem "$env:windir\SoftwareDistribution\Download" -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     foreach ($svc in 'bits', 'wuauserv') { Start-Service $svc -ErrorAction SilentlyContinue }
     # Delivery Optimization cache
@@ -634,8 +702,8 @@ if ($freeGB -lt $needGB) {
     # Recycle bin
     try { Clear-RecycleBin -DriveLetter $SysDrive.TrimEnd(':') -Force -ErrorAction Stop } catch { }
     # WinSxS superseded components
-    Write-Log 'Running DISM /StartComponentCleanup (can take several minutes)...'
-    Invoke-Native dism.exe @('/Online', '/Cleanup-Image', '/StartComponentCleanup', '/Quiet') | Out-Null
+    Write-Log 'Running DISM /StartComponentCleanup (up to 30 min)...'
+    Invoke-NativeWithTimeout dism.exe '/Online /Cleanup-Image /StartComponentCleanup /Quiet' -TimeoutMinutes 30 -Activity 'DISM StartComponentCleanup' | Out-Null
     $freeGB = Get-FreeGB
     Write-Log "Free space after cleanup: $freeGB GB"
     if ($freeGB -lt $needGB) {
@@ -649,21 +717,24 @@ Write-Log 'Disk space OK.' 'OK'
 #     produces a warning, but a quick repair helps avoid migration problems.
 try {
     if ($DeepHealthScan) {
-        Write-Log 'Running DISM ScanHealth (5-20 min)...'
-        $h = Repair-WindowsImage -Online -ScanHealth -NoRestart -ErrorAction Stop
+        Write-Log 'Running DISM ScanHealth (5-20 min, limit 30)...'
+        $state = Get-ComponentStoreState -Mode ScanHealth -TimeoutMinutes 30
     } else {
-        $h = Repair-WindowsImage -Online -CheckHealth -NoRestart -ErrorAction Stop
+        Write-Log 'Running DISM CheckHealth...'
+        $state = Get-ComponentStoreState -Mode CheckHealth -TimeoutMinutes 10
     }
-    Write-Log "Component store state: $($h.ImageHealthState)"
-    if ($h.ImageHealthState -ne 'Healthy') {
+    if ($null -eq $state) { throw 'the health check timed out' }
+    Write-Log "Component store state: $state"
+    if ($state -ne 'Healthy') {
         Write-Log 'Component store is flagged. Running DISM RestoreHealth + SFC...' 'WARN'
         try {
-            $r = Repair-WindowsImage -Online -RestoreHealth -NoRestart -ErrorAction Stop
-            Write-Log "After RestoreHealth: $($r.ImageHealthState)"
+            Write-Log 'Running DISM RestoreHealth (limit 30 min)...'
+            $r = Get-ComponentStoreState -Mode RestoreHealth -TimeoutMinutes 30
+            if ($null -ne $r) { Write-Log "After RestoreHealth: $r" }
         } catch { Write-Log "RestoreHealth failed ($($_.Exception.Message)). Continuing, since the media upgrade replaces the component store." 'WARN' }
-        Write-Log 'Running SFC /scannow (10-20 min)...'
-        $sfc = Invoke-Native sfc.exe @('/scannow')
-        Write-Log "SFC exit code: $($sfc.ExitCode) (details in %windir%\Logs\CBS\CBS.log)"
+        Write-Log 'Running SFC /scannow (10-20 min, limit 30)...'
+        $sfc = Invoke-NativeWithTimeout sfc.exe '/scannow' -TimeoutMinutes 30 -Activity 'SFC /scannow'
+        if (-not $sfc.TimedOut) { Write-Log "SFC exit code: $($sfc.ExitCode) (details in %windir%\Logs\CBS\CBS.log)" }
         $pending2 = @(Get-PendingRebootReasons)
         if ($pending2.Count -gt 0) { Exit-Script 14 'The repairs need a reboot. Reboot and run the script again.' }
     } else { Write-Log 'Component store healthy.' 'OK' }
