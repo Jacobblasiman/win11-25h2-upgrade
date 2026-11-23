@@ -1,0 +1,596 @@
+<#
+.SYNOPSIS
+    Export Entra ID sign-ins where report-only Conditional Access policies
+    produced selected report-only results.
+
+.DESCRIPTION
+    Uses Microsoft Graph PowerShell authentication and direct Graph REST paging.
+    Retrieval remains sequential and paced because auditLogs/signIns is governed
+    by tenant-level Identity and Access Reports throttling.
+
+    Improvements in this version:
+      - Connect-MgGraph handles authentication and token refresh
+      - AuditLog.Read.All only
+      - Manual @odata.nextLink paging with $top=1000
+      - Page-by-page CSV streaming to control memory use
+      - Transactional resume markers: failed slices are never marked complete
+      - HashSet result matching
+      - Newest-to-oldest slices and raw CSV concatenation, avoiding a global sort
+      - Retry-After handling plus adaptive pacing
+      - Existing partial slice files are removed before retry
+
+.EXAMPLE
+    .\Export-ReportOnlyCAFailures-v6.1.ps1 -Days 7 -PolicyName 'AVD'
+
+.EXAMPLE
+    .\Export-ReportOnlyCAFailures-v6.1.ps1 -Days 7 -Resume -PartDir .\parts_20261115
+
+.EXAMPLE
+    .\Export-ReportOnlyCAFailures-v6.1.ps1 -Days 1 `
+        -Results reportOnlyFailure,reportOnlySuccess,reportOnlyNotApplied `
+        -Diagnose
+#>
+
+[CmdletBinding()]
+param(
+    [string]$TenantId = 'organizations',
+
+    [ValidateRange(1, 30)]
+    [int]$Days = 7,
+
+    # Larger slices avoid extra first-page requests. A slice is still paged at 1,000 records.
+    [ValidateRange(1, 24)]
+    [int]$SliceHours = 24,
+
+    # Five requests per 10 seconds is the published tenant-level ceiling for this service.
+    # Four leaves headroom for the Entra portal and other callers.
+    [ValidateRange(0.1, 5.0)]
+    [double]$RequestsPer10Sec = 4,
+
+    [string]$PolicyId,
+    [string]$PolicyName,
+
+    [ValidateSet(
+        'reportOnlyFailure',
+        'reportOnlySuccess',
+        'reportOnlyNotApplied',
+        'reportOnlyInterrupted'
+    )]
+    [string[]]$Results = @('reportOnlyFailure'),
+
+    [switch]$InteractiveOnly,
+
+    [string]$OutFile = ".\ReportOnly_CA_Failures_$(Get-Date -Format yyyyMMdd_HHmm).csv",
+    [string]$PartDir,
+    [switch]$Resume,
+
+    # Tally every report-only policy result encountered.
+    [switch]$Diagnose
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+#region ---------- Prerequisites and authentication ----------
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+    throw @'
+Microsoft.Graph.Authentication is not installed.
+Install it with:
+  Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+'@
+}
+
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
+$connectParams = @{
+    Scopes        = @('AuditLog.Read.All')
+    UseDeviceCode = $true
+    NoWelcome     = $true
+    ErrorAction   = 'Stop'
+}
+
+if ($TenantId -and $TenantId -ne 'organizations') {
+    $connectParams.TenantId = $TenantId
+}
+
+Write-Host 'Signing in to Microsoft Graph...' -ForegroundColor Cyan
+Connect-MgGraph @connectParams
+
+$context = Get-MgContext
+if (-not $context) {
+    throw 'Connect-MgGraph completed without an active Microsoft Graph context.'
+}
+
+Write-Host "Authenticated as: $($context.Account)" -ForegroundColor Green
+#endregion
+
+#region ---------- Matching helpers ----------
+$resultSet = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+foreach ($result in $Results) {
+    [void]$resultSet.Add($result)
+}
+
+function Test-PolicyNameMatch {
+    param(
+        [AllowNull()][string]$Candidate,
+        [AllowNull()][string]$Requested
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Requested)) {
+        return $true
+    }
+
+    if ([string]::IsNullOrEmpty($Candidate)) {
+        return $false
+    }
+
+    return $Candidate.IndexOf(
+        $Requested,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -ge 0
+}
+#endregion
+
+#region ---------- Pacer and Graph request wrapper ----------
+$script:MinInterval = 10.0 / $RequestsPer10Sec
+$script:LastCallUtc = [DateTime]::MinValue
+$script:Throttles   = 0
+$script:Requests    = 0
+
+function Get-HttpStatusCode {
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    try {
+        return [int]$ErrorRecord.Exception.Response.StatusCode
+    }
+    catch {}
+
+    try {
+        return [int]$ErrorRecord.Exception.Response.StatusCode.value__
+    }
+    catch {}
+
+    return $null
+}
+
+function Get-RetryAfterSeconds {
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    try {
+        $values = $ErrorRecord.Exception.Response.Headers.GetValues('Retry-After')
+        if ($values -and $values[0]) {
+            $seconds = 0
+            if ([int]::TryParse([string]$values[0], [ref]$seconds)) {
+                return [Math]::Max(1, $seconds)
+            }
+
+            $retryDate = [DateTimeOffset]::MinValue
+            if ([DateTimeOffset]::TryParse([string]$values[0], [ref]$retryDate)) {
+                return [Math]::Max(
+                    1,
+                    [int][Math]::Ceiling(($retryDate - [DateTimeOffset]::UtcNow).TotalSeconds)
+                )
+            }
+        }
+    }
+    catch {}
+
+    return $null
+}
+
+function Invoke-PacedGraph {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    while ($true) {
+        $elapsed = ([DateTime]::UtcNow - $script:LastCallUtc).TotalSeconds
+        $remaining = $script:MinInterval - $elapsed
+
+        if ($remaining -gt 0) {
+            Start-Sleep -Milliseconds ([int][Math]::Ceiling($remaining * 1000))
+        }
+
+        $script:LastCallUtc = [DateTime]::UtcNow
+        $script:Requests++
+
+        try {
+            return Invoke-MgGraphRequest `
+                -Method GET `
+                -Uri $Uri `
+                -Headers @{ Prefer = 'include-unknown-enum-members' } `
+                -OutputType PSObject `
+                -ErrorAction Stop
+        }
+        catch {
+            $statusCode = Get-HttpStatusCode -ErrorRecord $_
+
+            if ($statusCode -notin 429, 503, 504) {
+                throw
+            }
+
+            $script:Throttles++
+            $retryAfter = Get-RetryAfterSeconds -ErrorRecord $_
+
+            if (-not $retryAfter) {
+                $retryAfter = switch ($statusCode) {
+                    429     { 10 }
+                    503     { 15 }
+                    504     { 10 }
+                    default { 10 }
+                }
+            }
+
+            # Slow future calls after a throttle, but retain a practical upper bound.
+            $script:MinInterval = [Math]::Min($script:MinInterval * 1.25, 10.0)
+
+            Write-Warning (
+                'HTTP {0}; retrying in {1}s; pace now {2:N2}s/request' -f
+                $statusCode,
+                $retryAfter,
+                $script:MinInterval
+            )
+
+            Start-Sleep -Seconds $retryAfter
+        }
+    }
+}
+#endregion
+
+#region ---------- Preflight ----------
+Write-Host 'Preflight: checking Conditional Access data visibility...' -ForegroundColor Cyan
+$probe = Invoke-PacedGraph -Uri 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=50'
+$withCa = @($probe.value | Where-Object {
+    $_.appliedConditionalAccessPolicies -and
+    $_.appliedConditionalAccessPolicies.Count -gt 0
+})
+
+if ($withCa.Count -eq 0) {
+    Write-Warning 'appliedConditionalAccessPolicies was empty on all 50 sample records.'
+    Write-Warning 'The account may read sign-ins but lack a role that can read Conditional Access data.'
+}
+else {
+    $samplePolicies = @(
+        $withCa.appliedConditionalAccessPolicies |
+            Where-Object { $_.result -like 'reportOnly*' } |
+            Select-Object -ExpandProperty displayName -Unique
+    )
+
+    $sampleText = if ($samplePolicies.Count) {
+        $samplePolicies -join ', '
+    }
+    else {
+        '(none observed in the 50-record sample)'
+    }
+
+    Write-Host "CA data visible. Sample report-only policies: $sampleText" -ForegroundColor Green
+}
+#endregion
+
+#region ---------- Output paths and newest-first slices ----------
+$outFullPath = [IO.Path]::GetFullPath($OutFile)
+$outParent = Split-Path -Parent $outFullPath
+if (-not (Test-Path -LiteralPath $outParent)) {
+    New-Item -ItemType Directory -Path $outParent -Force | Out-Null
+}
+
+$endUtc   = [DateTime]::UtcNow
+$startUtc = $endUtc.AddDays(-$Days)
+
+if (-not $PartDir) {
+    $PartDir = Join-Path $outParent "careportonly_parts_$(Get-Date -Format yyyyMMdd_HHmmss)"
+}
+$PartDir = [IO.Path]::GetFullPath($PartDir)
+New-Item -ItemType Directory -Path $PartDir -Force | Out-Null
+
+$slices = [System.Collections.Generic.List[object]]::new()
+$cursorEnd = $endUtc
+$index = 0
+
+while ($cursorEnd -gt $startUtc) {
+    $cursorStart = $cursorEnd.AddHours(-$SliceHours)
+    if ($cursorStart -lt $startUtc) {
+        $cursorStart = $startUtc
+    }
+
+    $slices.Add([pscustomobject]@{
+        Index = $index
+        From  = $cursorStart.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        To    = $cursorEnd.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    })
+
+    $index++
+    $cursorEnd = $cursorStart
+}
+
+Write-Host "`nWindow : $($startUtc.ToString('u')) -> $($endUtc.ToString('u'))" -ForegroundColor Cyan
+Write-Host "Slices : $($slices.Count) x up to ${SliceHours}h, newest first" -ForegroundColor Cyan
+Write-Host "Pace  : $([Math]::Round($script:MinInterval, 2)) seconds/request" -ForegroundColor Cyan
+Write-Host "Match : $($Results -join ', ')`n" -ForegroundColor Cyan
+#endregion
+
+#region ---------- Pull and stream each page ----------
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$totalScanned = 0L
+$totalMatched = 0L
+$resultTally = @{}
+$completedSlices = 0
+
+foreach ($slice in $slices) {
+    $partFile = Join-Path $PartDir ('part_{0:d4}.csv' -f $slice.Index)
+    $doneFile = "$partFile.done"
+
+    if ($Resume -and (Test-Path -LiteralPath $doneFile)) {
+        Write-Host (
+            'slice {0,-3} {1} SKIPPED (complete)' -f
+            $slice.Index,
+            $slice.From.Substring(0, 13)
+        ) -ForegroundColor DarkGreen
+
+        $completedSlices++
+        continue
+    }
+
+    # A part without a .done marker is incomplete and must not be appended to.
+    Remove-Item -LiteralPath $partFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $doneFile -Force -ErrorAction SilentlyContinue
+
+    $filter = "createdDateTime ge $($slice.From) and createdDateTime lt $($slice.To)"
+    if ($InteractiveOnly) {
+        $filter += ' and isInteractive eq true'
+    }
+
+    $uri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=1000&$filter=' +
+        [Uri]::EscapeDataString($filter)
+
+    $scanned = 0L
+    $matched = 0L
+    $page = 0
+    $partInitialized = $false
+
+    try {
+        while ($uri) {
+            $page++
+            $resp = Invoke-PacedGraph -Uri $uri
+            $pageValues = @($resp.value)
+            $scanned += $pageValues.Count
+
+            $pageRows = @(
+                foreach ($signIn in $pageValues) {
+                    foreach ($policy in @($signIn.appliedConditionalAccessPolicies)) {
+                        if ($Diagnose -and $policy.result -like 'reportOnly*') {
+                            $key = "$($policy.displayName) | $($policy.result)"
+                            if ($resultTally.ContainsKey($key)) {
+                                $resultTally[$key]++
+                            }
+                            else {
+                                $resultTally[$key] = 1L
+                            }
+                        }
+
+                        if (-not $resultSet.Contains([string]$policy.result)) {
+                            continue
+                        }
+
+                        if ($PolicyId -and $policy.id -ne $PolicyId) {
+                            continue
+                        }
+
+                        if (-not (Test-PolicyNameMatch `
+                            -Candidate $policy.displayName `
+                            -Requested $PolicyName)) {
+                            continue
+                        }
+
+                        [pscustomobject]@{
+                            SignInTime       = $signIn.createdDateTime
+                            User             = $signIn.userPrincipalName
+                            DisplayName      = $signIn.userDisplayName
+                            App              = $signIn.appDisplayName
+                            Resource         = $signIn.resourceDisplayName
+                            ClientApp        = $signIn.clientAppUsed
+                            IsInteractive    = $signIn.isInteractive
+                            PolicyName       = $policy.displayName
+                            PolicyId         = $policy.id
+                            PolicyResult     = $policy.result
+                            GrantControls    = $policy.enforcedGrantControls -join '; '
+                            SessionControls  = $policy.enforcedSessionControls -join '; '
+                            IPAddress        = $signIn.ipAddress
+                            City             = $signIn.location.city
+                            State            = $signIn.location.state
+                            Country          = $signIn.location.countryOrRegion
+                            DeviceName       = $signIn.deviceDetail.displayName
+                            DeviceId         = $signIn.deviceDetail.deviceId
+                            OS               = $signIn.deviceDetail.operatingSystem
+                            Browser          = $signIn.deviceDetail.browser
+                            TrustType        = $signIn.deviceDetail.trustType
+                            IsCompliant      = $signIn.deviceDetail.isCompliant
+                            IsManaged        = $signIn.deviceDetail.isManaged
+                            ActualErrorCode  = $signIn.status.errorCode
+                            ActualFailReason = $signIn.status.failureReason
+                            CorrelationId    = $signIn.correlationId
+                            SignInId         = $signIn.id
+                        }
+                    }
+                }
+            )
+
+            if ($pageRows.Count) {
+                if ($partInitialized) {
+                    $pageRows | Export-Csv `
+                        -LiteralPath $partFile `
+                        -NoTypeInformation `
+                        -Encoding UTF8 `
+                        -Append
+                }
+                else {
+                    $pageRows | Export-Csv `
+                        -LiteralPath $partFile `
+                        -NoTypeInformation `
+                        -Encoding UTF8
+                    $partInitialized = $true
+                }
+
+                $matched += $pageRows.Count
+            }
+
+            $effectiveScanned = $totalScanned + $scanned
+            $rate = if ($stopwatch.Elapsed.TotalSeconds -gt 0) {
+                $effectiveScanned / $stopwatch.Elapsed.TotalSeconds
+            }
+            else {
+                0
+            }
+
+            Write-Host (
+                "`r  slice {0,-3} page {1,-4} scanned {2,-9} matched {3,-6} {4:N0} rec/s   " -f
+                $slice.Index,
+                $page,
+                $scanned,
+                $matched,
+                $rate
+            ) -NoNewline -ForegroundColor DarkGray
+
+            # The final page does not include @odata.nextLink. Under StrictMode,
+            # direct access to a missing property throws instead of returning $null.
+            $nextLinkProperty = $resp.PSObject.Properties['@odata.nextLink']
+            $uri = if ($null -ne $nextLinkProperty) {
+                [string]$nextLinkProperty.Value
+            }
+            else {
+                $null
+            }
+        }
+
+        # Completion is committed only after the full nextLink chain ends successfully.
+        New-Item -ItemType File -Path $doneFile -Force | Out-Null
+    }
+    catch {
+        Remove-Item -LiteralPath $partFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $doneFile -Force -ErrorAction SilentlyContinue
+
+        throw (
+            'Slice {0}, page {1} failed. Incomplete output was removed. {2}' -f
+            $slice.Index,
+            $page,
+            $_.Exception.Message
+        )
+    }
+
+    $totalScanned += $scanned
+    $totalMatched += $matched
+    $completedSlices++
+
+    $percent = [int](($completedSlices / $slices.Count) * 100)
+    $eta = if ($completedSlices -gt 0) {
+        [TimeSpan]::FromSeconds(
+            ($stopwatch.Elapsed.TotalSeconds / $completedSlices) *
+            ($slices.Count - $completedSlices)
+        )
+    }
+    else {
+        [TimeSpan]::Zero
+    }
+
+    Write-Host (
+        "`rslice {0,-3} {1} scanned {2,-9} matched {3,-6} [{4}%] ETA {5:hh\:mm\:ss}        " -f
+        $slice.Index,
+        $slice.From.Substring(0, 13),
+        $scanned,
+        $matched,
+        $percent,
+        $eta
+    ) -ForegroundColor Gray
+}
+
+$stopwatch.Stop()
+#endregion
+
+#region ---------- Diagnose ----------
+Write-Host (
+    "`nRequests: {0} | Throttled: {1} | Final pace: {2:N2}s/request" -f
+    $script:Requests,
+    $script:Throttles,
+    $script:MinInterval
+) -ForegroundColor DarkCyan
+
+if ($Diagnose -and $resultTally.Count) {
+    Write-Host "`n--- Report-only results observed during this run ---" -ForegroundColor Magenta
+    $resultTally.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Select-Object `
+            @{ Name = 'Policy | Result'; Expression = { $_.Key } },
+            @{ Name = 'Count'; Expression = { $_.Value } } |
+        Format-Table -AutoSize
+}
+#endregion
+
+#region ---------- Merge without importing or sorting all rows ----------
+$parts = @(
+    Get-ChildItem -LiteralPath $PartDir -Filter 'part_*.csv' -File -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath "$($_.FullName).done" } |
+        Sort-Object Name
+)
+
+if ($parts.Count -eq 0) {
+    Write-Warning "Scanned $totalScanned sign-ins during this run and found no completed part files containing matches."
+    Write-Warning 'Rerun a smaller window with -Diagnose to see which report-only results are present.'
+    return
+}
+
+$writer = [IO.StreamWriter]::new(
+    $outFullPath,
+    $false,
+    [Text.UTF8Encoding]::new($true)
+)
+
+try {
+    $headerWritten = $false
+
+    foreach ($part in $parts) {
+        $reader = [IO.StreamReader]::new($part.FullName)
+        try {
+            $header = $reader.ReadLine()
+
+            if (-not $headerWritten -and $header) {
+                $writer.WriteLine($header)
+                $headerWritten = $true
+            }
+
+            while (-not $reader.EndOfStream) {
+                $writer.WriteLine($reader.ReadLine())
+            }
+        }
+        finally {
+            $reader.Dispose()
+        }
+    }
+}
+finally {
+    $writer.Dispose()
+}
+
+Write-Host "`nDone in $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+Write-Host "Scanned this run : $totalScanned" -ForegroundColor Green
+Write-Host "Matched this run : $totalMatched" -ForegroundColor Green
+Write-Host "CSV              : $outFullPath" -ForegroundColor Green
+Write-Host "Parts            : $PartDir" -ForegroundColor DarkGray
+
+# This summary is intentionally performed after the export. Group-Object retains
+# matching rows by policy; remove this block if final-report memory usage matters
+# more than the console summary.
+Import-Csv -LiteralPath $outFullPath |
+    Group-Object PolicyName |
+    Sort-Object Count -Descending |
+    Select-Object `
+        @{ Name = 'Policy'; Expression = { $_.Name } },
+        @{ Name = 'Events'; Expression = { $_.Count } },
+        @{ Name = 'UniqueUsers'; Expression = {
+            @($_.Group.User | Select-Object -Unique).Count
+        } } |
+    Format-Table -AutoSize
+#endregion
