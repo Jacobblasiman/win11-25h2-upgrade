@@ -1,34 +1,38 @@
+#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Export Entra ID sign-ins where report-only Conditional Access policies
+    Export Entra ID sign-ins whose report-only Conditional Access policies
     produced selected report-only results.
 
 .DESCRIPTION
-    Uses Microsoft Graph PowerShell authentication and direct Graph REST paging.
-    Retrieval remains sequential and paced because auditLogs/signIns is governed
-    by tenant-level Identity and Access Reports throttling.
+    Reads https://graph.microsoft.com/v1.0/auditLogs/signIns, the same sign-in
+    report the Entra portal uses. Report-only policy results are not a
+    documented server-side filter, so the script asks Graph to apply that
+    filter and, if Graph rejects it, downloads each sign-in in the window and
+    matches locally.
 
-    Improvements in this version:
-      - Connect-MgGraph handles authentication and token refresh
-      - AuditLog.Read.All only
-      - Manual @odata.nextLink paging with $top=1000
-      - Page-by-page CSV streaming to control memory use
-      - Transactional resume markers: failed slices are never marked complete
-      - HashSet result matching
-      - Newest-to-oldest slices and raw CSV concatenation, avoiding a global sort
-      - Retry-After handling plus adaptive pacing
-      - Existing partial slice files are removed before retry
+    The Identity and Access Reports service allows 5 requests per 10 seconds
+    for each app in a tenant. Several time slices stay in flight so a slow
+    page does not leave that budget idle. Each request asks only for the
+    columns that are exported, and System.Text.Json reads the page without
+    building a PowerShell object per policy.
 
-.EXAMPLE
-    .\Export-ReportOnlyCAFailures-v6.1.ps1 -Days 7 -PolicyName 'AVD'
+    Runs on PowerShell 7 or newer on macOS, Windows, and Linux.
+    macOS:  brew install --cask powershell
+    Windows: winget install Microsoft.PowerShell
 
 .EXAMPLE
-    .\Export-ReportOnlyCAFailures-v6.1.ps1 -Days 7 -Resume -PartDir .\parts_20261115
+    pwsh -File ./Get-ReportOnlyCAFailures -Days 7 -PolicyName 'AVD'
 
 .EXAMPLE
-    .\Export-ReportOnlyCAFailures-v6.1.ps1 -Days 1 `
-        -Results reportOnlyFailure,reportOnlySuccess,reportOnlyNotApplied `
-        -Diagnose
+    pwsh -File ./Get-ReportOnlyCAFailures -Days 7 -Resume -PartDir ./parts_20261115
+
+.EXAMPLE
+    pwsh -File ./Get-ReportOnlyCAFailures -Days 1 -Diagnose `
+        -Results reportOnlyFailure,reportOnlySuccess,reportOnlyNotApplied
+
+.EXAMPLE
+    pwsh -File ./Get-ReportOnlyCAFailures -SelfTest
 #>
 
 [CmdletBinding()]
@@ -38,14 +42,20 @@ param(
     [ValidateRange(1, 30)]
     [int]$Days = 7,
 
-    # Larger slices avoid extra first-page requests. A slice is still paged at 1,000 records.
+    # Upper bound on a time slice. The script uses a shorter slice when that
+    # is what it takes to keep more than one page chain in flight.
     [ValidateRange(1, 24)]
     [int]$SliceHours = 24,
 
-    # Five requests per 10 seconds is the published tenant-level ceiling for this service.
-    # Four leaves headroom for the Entra portal and other callers.
-    [ValidateRange(0.1, 5.0)]
-    [double]$RequestsPer10Sec = 4,
+    # Published ceiling for this service is 5 requests per 10 seconds per app
+    # per tenant. Higher values usually come back as HTTP 429.
+    [ValidateRange(0.1, 8.0)]
+    [double]$RequestsPer10Sec = 5,
+
+    # How many page downloads may be outstanding. The request rate stays at
+    # -RequestsPer10Sec; this only hides round-trip latency.
+    [ValidateRange(1, 12)]
+    [int]$MaxInFlight = 8,
 
     [string]$PolicyId,
     [string]$PolicyName,
@@ -63,15 +73,1634 @@ param(
     [string]$OutFile = ".\ReportOnly_CA_Failures_$(Get-Date -Format yyyyMMdd_HHmm).csv",
     [string]$PartDir,
     [switch]$Resume,
-
-    # Tally every report-only policy result encountered.
-    [switch]$Diagnose
+    [switch]$Diagnose,
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
-#region ---------- Prerequisites and authentication ----------
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw @'
+This script requires PowerShell 7 or newer. PowerShell 7 is the build that runs on macOS, Windows, and Linux.
+  macOS:   brew install --cask powershell
+  Windows: winget install Microsoft.PowerShell
+Start the script with: pwsh -File ./Get-ReportOnlyCAFailures
+'@
+}
+
+$script:PageReaderSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+
+public sealed class PageCursor
+{
+    public bool HeaderWritten;
+    public long Scanned;
+    public long Matched;
+    public bool SawPolicies;
+    public string NextLink;
+}
+
+public sealed class PolicyRollup
+{
+    public string Policy { get; set; }
+    public int Events { get; set; }
+    public int UniqueUsers { get; set; }
+}
+
+public static class SignInPageReader
+{
+    public const string Header =
+        "SignInTime,User,DisplayName,App,Resource,ClientApp,IsInteractive,PolicyName,PolicyId,PolicyResult,GrantControls,SessionControls,IPAddress,City,State,Country,DeviceName,DeviceId,OS,Browser,TrustType,IsCompliant,IsManaged,ActualErrorCode,ActualFailReason,CorrelationId,SignInId";
+
+    public static void Consume(
+        Stream utf8Json,
+        TextWriter csv,
+        PageCursor cursor,
+        HashSet<string> results,
+        string policyId,
+        string policyName,
+        bool diagnose,
+        Dictionary<string, long> resultTally,
+        List<string> samplePolicies)
+    {
+        cursor.Scanned = 0;
+        cursor.Matched = 0;
+        cursor.SawPolicies = false;
+        cursor.NextLink = null;
+
+        using (var doc = JsonDocument.Parse(utf8Json))
+        {
+            var root = doc.RootElement;
+            cursor.NextLink = ReadNextLink(root);
+            JsonElement value;
+            if (!root.TryGetProperty("value", out value) || value.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+
+            foreach (var signIn in value.EnumerateArray())
+            {
+                cursor.Scanned++;
+                JsonElement policies;
+                if (!signIn.TryGetProperty("appliedConditionalAccessPolicies", out policies) ||
+                    policies.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                foreach (var policy in policies.EnumerateArray())
+                {
+                    cursor.SawPolicies = true;
+                    var result = Field(policy, "result");
+                    if (diagnose && resultTally != null &&
+                        result.StartsWith("reportOnly", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var key = Field(policy, "displayName") + " | " + result;
+                        long count;
+                        resultTally.TryGetValue(key, out count);
+                        resultTally[key] = count + 1;
+                    }
+
+                    NoteSample(samplePolicies, policy, result);
+
+                    if (result.Length == 0 || results == null || !results.Contains(result))
+                    {
+                        continue;
+                    }
+
+                    var id = Field(policy, "id");
+                    if (!string.IsNullOrEmpty(policyId) &&
+                        !string.Equals(id, policyId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var name = Field(policy, "displayName");
+                    if (!string.IsNullOrEmpty(policyName) &&
+                        name.IndexOf(policyName, StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+
+                    if (!cursor.HeaderWritten)
+                    {
+                        csv.WriteLine(Header);
+                        cursor.HeaderWritten = true;
+                    }
+
+                    WriteRow(csv, signIn, policy, name, id, result);
+                    cursor.Matched++;
+                }
+            }
+        }
+    }
+
+    public static PolicyRollup[] Summarize(string path)
+    {
+        var events = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var users = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+        using (var reader = new StreamReader(path, Encoding.UTF8, true))
+        {
+            var headerLine = reader.ReadLine();
+            if (headerLine == null)
+            {
+                return new PolicyRollup[0];
+            }
+
+            var header = SplitCsv(headerLine);
+            int policyCol = IndexOf(header, "PolicyName");
+            int userCol = IndexOf(header, "User");
+            if (policyCol < 0 || userCol < 0)
+            {
+                return new PolicyRollup[0];
+            }
+
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                var fields = SplitCsv(line);
+                if (fields.Count <= policyCol || fields.Count <= userCol)
+                {
+                    continue;
+                }
+
+                var policy = fields[policyCol];
+                var user = fields[userCol];
+                int count;
+                events.TryGetValue(policy, out count);
+                events[policy] = count + 1;
+
+                HashSet<string> set;
+                if (!users.TryGetValue(policy, out set))
+                {
+                    set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    users[policy] = set;
+                }
+
+                if (!string.IsNullOrEmpty(user))
+                {
+                    set.Add(user);
+                }
+            }
+        }
+
+        var rollups = new List<PolicyRollup>(events.Count);
+        foreach (var pair in events)
+        {
+            rollups.Add(new PolicyRollup
+            {
+                Policy = pair.Key,
+                Events = pair.Value,
+                UniqueUsers = users[pair.Key].Count
+            });
+        }
+
+        return rollups.ToArray();
+    }
+
+    static void WriteRow(TextWriter csv, JsonElement signIn, JsonElement policy, string name, string id, string result)
+    {
+        WriteCsvField(csv, Field(signIn, "createdDateTime"), true);
+        WriteCsvField(csv, Field(signIn, "userPrincipalName"), true);
+        WriteCsvField(csv, Field(signIn, "userDisplayName"), true);
+        WriteCsvField(csv, Field(signIn, "appDisplayName"), true);
+        WriteCsvField(csv, Field(signIn, "resourceDisplayName"), true);
+        WriteCsvField(csv, Field(signIn, "clientAppUsed"), true);
+        WriteCsvField(csv, Field(signIn, "isInteractive"), true);
+        WriteCsvField(csv, name, true);
+        WriteCsvField(csv, id, true);
+        WriteCsvField(csv, result, true);
+        WriteCsvField(csv, JoinArray(policy, "enforcedGrantControls"), true);
+        WriteCsvField(csv, JoinArray(policy, "enforcedSessionControls"), true);
+        WriteCsvField(csv, Field(signIn, "ipAddress"), true);
+        WriteCsvField(csv, Nested(signIn, "location", "city"), true);
+        WriteCsvField(csv, Nested(signIn, "location", "state"), true);
+        WriteCsvField(csv, Nested(signIn, "location", "countryOrRegion"), true);
+        WriteCsvField(csv, Nested(signIn, "deviceDetail", "displayName"), true);
+        WriteCsvField(csv, Nested(signIn, "deviceDetail", "deviceId"), true);
+        WriteCsvField(csv, Nested(signIn, "deviceDetail", "operatingSystem"), true);
+        WriteCsvField(csv, Nested(signIn, "deviceDetail", "browser"), true);
+        WriteCsvField(csv, Nested(signIn, "deviceDetail", "trustType"), true);
+        WriteCsvField(csv, Nested(signIn, "deviceDetail", "isCompliant"), true);
+        WriteCsvField(csv, Nested(signIn, "deviceDetail", "isManaged"), true);
+        WriteCsvField(csv, Nested(signIn, "status", "errorCode"), true);
+        WriteCsvField(csv, Nested(signIn, "status", "failureReason"), true);
+        WriteCsvField(csv, Field(signIn, "correlationId"), true);
+        WriteCsvField(csv, Field(signIn, "id"), false);
+        csv.WriteLine();
+    }
+
+    static void WriteCsvField(TextWriter csv, string value, bool more)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            if (more) csv.Write(',');
+            return;
+        }
+
+        value = value.Replace("\r\n", " ").Replace('\r', ' ').Replace('\n', ' ');
+        if (value.IndexOf(',') >= 0 || value.IndexOf('"') >= 0)
+        {
+            csv.Write('"');
+            csv.Write(value.Replace("\"", "\"\""));
+            csv.Write('"');
+        }
+        else
+        {
+            csv.Write(value);
+        }
+
+        if (more) csv.Write(',');
+    }
+
+    static string Field(JsonElement obj, string name)
+    {
+        if (obj.ValueKind != JsonValueKind.Object) return "";
+        JsonElement property;
+        if (!obj.TryGetProperty(name, out property) ||
+            property.ValueKind == JsonValueKind.Null ||
+            property.ValueKind == JsonValueKind.Undefined)
+        {
+            return "";
+        }
+
+        if (property.ValueKind == JsonValueKind.String) return property.GetString() ?? "";
+        if (property.ValueKind == JsonValueKind.True) return "True";
+        if (property.ValueKind == JsonValueKind.False) return "False";
+        return property.ToString();
+    }
+
+    static string Nested(JsonElement obj, string parent, string child)
+    {
+        if (obj.ValueKind != JsonValueKind.Object) return "";
+        JsonElement node;
+        if (!obj.TryGetProperty(parent, out node) || node.ValueKind != JsonValueKind.Object)
+        {
+            return "";
+        }
+
+        return Field(node, child);
+    }
+
+    static string JoinArray(JsonElement obj, string name)
+    {
+        if (obj.ValueKind != JsonValueKind.Object) return "";
+        JsonElement items;
+        if (!obj.TryGetProperty(name, out items) || items.ValueKind != JsonValueKind.Array)
+        {
+            return "";
+        }
+
+        var builder = new StringBuilder();
+        bool first = true;
+        foreach (var item in items.EnumerateArray())
+        {
+            if (!first) builder.Append("; ");
+            first = false;
+            if (item.ValueKind == JsonValueKind.String) builder.Append(item.GetString());
+            else if (item.ValueKind != JsonValueKind.Null && item.ValueKind != JsonValueKind.Undefined)
+                builder.Append(item.ToString());
+        }
+
+        return builder.ToString();
+    }
+
+    static string ReadNextLink(JsonElement root)
+    {
+        JsonElement link;
+        if (!root.TryGetProperty("@odata.nextLink", out link) || link.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        var text = link.GetString();
+        return string.IsNullOrEmpty(text) ? null : text;
+    }
+
+    static void NoteSample(List<string> samplePolicies, JsonElement policy, string result)
+    {
+        if (samplePolicies == null || samplePolicies.Count >= 12) return;
+        if (!result.StartsWith("reportOnly", StringComparison.OrdinalIgnoreCase)) return;
+        var name = Field(policy, "displayName");
+        if (name.Length == 0 || samplePolicies.Contains(name)) return;
+        samplePolicies.Add(name);
+    }
+
+    static List<string> SplitCsv(string line)
+    {
+        var fields = new List<string>();
+        var builder = new StringBuilder();
+        bool quoted = false;
+        for (int i = 0; i < line.Length; i++)
+        {
+            char c = line[i];
+            if (quoted)
+            {
+                if (c == '"')
+                {
+                    if (i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        builder.Append('"');
+                        i++;
+                    }
+                    else
+                    {
+                        quoted = false;
+                    }
+                }
+                else
+                {
+                    builder.Append(c);
+                }
+            }
+            else if (c == '"')
+            {
+                quoted = true;
+            }
+            else if (c == ',')
+            {
+                fields.Add(builder.ToString());
+                builder.Clear();
+            }
+            else
+            {
+                builder.Append(c);
+            }
+        }
+
+        fields.Add(builder.ToString());
+        return fields;
+    }
+
+    static int IndexOf(List<string> fields, string name)
+    {
+        for (int i = 0; i < fields.Count; i++)
+        {
+            if (string.Equals(fields[i], name, StringComparison.OrdinalIgnoreCase)) return i;
+        }
+
+        return -1;
+    }
+}
+'@
+
+if (-not ('SignInPageReader' -as [type])) {
+    Add-Type -ReferencedAssemblies @(
+        'System.Runtime',
+        'System.Collections',
+        'netstandard',
+        'System.Text.Json',
+        'System.Memory',
+        'System.Text.Encodings.Web'
+    ) -TypeDefinition $script:PageReaderSource -Language CSharp
+}
+
+function ConvertTo-GraphUtc {
+    param([Parameter(Mandatory)][DateTime]$Value)
+
+    if ($Value.Kind -eq [DateTimeKind]::Local) {
+        $Value = $Value.ToUniversalTime()
+    }
+    elseif ($Value.Kind -eq [DateTimeKind]::Unspecified) {
+        $Value = [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc)
+    }
+
+    # Quote the separators. Unquoted ':' follows the current culture and is
+    # '.' on macOS systems that use a Finnish or Italian locale.
+    return $Value.ToString(
+        "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+}
+
+function Resolve-UserPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ($Path -eq '~') {
+        $Path = [Environment]::GetFolderPath('UserProfile')
+    }
+    elseif ($Path.StartsWith('~/') -or $Path.StartsWith('~\')) {
+        $Path = Join-Path ([Environment]::GetFolderPath('UserProfile')) $Path.Substring(2)
+    }
+
+    return [IO.Path]::GetFullPath($Path)
+}
+
+function Get-PolicyClause {
+    # Full asks Graph to return only sign-ins whose applied policy result is one
+    # of -Results. That predicate is not documented; IdOnly is. Off downloads
+    # the window and matches locally. Client matching always still runs.
+    if ($script:ServerFilterMode -eq 'Off') {
+        return $null
+    }
+
+    if ($script:ServerFilterMode -eq 'IdOnly') {
+        if (-not $script:PolicyGuid) {
+            return $null
+        }
+
+        return "appliedConditionalAccessPolicies/any(p:p/id eq '$($script:PolicyGuid)')"
+    }
+
+    $resultParts = @(
+        foreach ($result in $Results) {
+            "p/result eq '$result'"
+        }
+    )
+
+    $resultExpr = if ($resultParts.Count -eq 1) {
+        $resultParts[0]
+    }
+    else {
+        '(' + ($resultParts -join ' or ') + ')'
+    }
+
+    if ($script:PolicyGuid) {
+        return "appliedConditionalAccessPolicies/any(p:p/id eq '$($script:PolicyGuid)' and $resultExpr)"
+    }
+
+    return "appliedConditionalAccessPolicies/any(p:$resultExpr)"
+}
+
+function Disable-ServerFilter {
+    if ($script:ServerFilterMode -eq 'Full' -and $script:PolicyGuid) {
+        $script:ServerFilterMode = 'IdOnly'
+        Write-Warning 'Graph rejected filtering on report-only results. Retrying with the policy id only.'
+        return $true
+    }
+
+    if ($script:ServerFilterMode -ne 'Off') {
+        $script:ServerFilterMode = 'Off'
+        Write-Warning 'Graph rejected the server-side Conditional Access filter. Every sign-in in the window will be downloaded and matched locally.'
+        return $true
+    }
+
+    return $false
+}
+
+function Get-SliceFilter {
+    param($Slice)
+
+    $filter = 'createdDateTime ge {0} and createdDateTime lt {1}' -f $Slice.From, $Slice.To
+    if ($InteractiveOnly) {
+        $filter += ' and isInteractive eq true'
+    }
+
+    $clause = Get-PolicyClause
+    if ($clause) {
+        $filter += ' and ' + $clause
+    }
+
+    return $filter
+}
+
+function New-SignInUri {
+    param(
+        [Parameter(Mandatory)][string]$Filter,
+        [int]$Top = 1000
+    )
+
+    $uri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=' + $Top
+    if ($script:UseSelect) {
+        $uri += '&$select=' + [Uri]::EscapeDataString($script:SelectList)
+    }
+
+    $uri += '&$filter=' + [Uri]::EscapeDataString($Filter)
+    return $uri
+}
+
+function Update-QueryMode {
+    param([string]$Body)
+
+    if ($script:QueryModeLocked) {
+        return $false
+    }
+
+    $filterHit = $Body -match '(?i)filter|appliedConditionalAccess'
+    $selectHit = $Body -match '(?i)\$select|\bselect\b'
+
+    if ($script:ServerFilterMode -ne 'Off' -and $filterHit -and -not $selectHit) {
+        return (Disable-ServerFilter)
+    }
+
+    if ($script:UseSelect -and $selectHit -and -not $filterHit) {
+        $script:UseSelect = $false
+        Write-Warning 'Graph rejected $select. Downloading full sign-in records.'
+        return $true
+    }
+
+    if ($script:ServerFilterMode -ne 'Off') {
+        return (Disable-ServerFilter)
+    }
+
+    if ($script:UseSelect) {
+        $script:UseSelect = $false
+        Write-Warning 'Graph rejected the sign-in query. Retrying without $select.'
+        return $true
+    }
+
+    return $false
+}
+
+function Get-RetryAfterSeconds {
+    param($Response)
+
+    $values = $null
+    if (-not $Response.Headers.TryGetValues('Retry-After', [ref]$values)) {
+        return $null
+    }
+
+    $raw = [string](@($values) | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return $null
+    }
+
+    $seconds = 0
+    if ([int]::TryParse($raw, [ref]$seconds)) {
+        return [Math]::Max(1, $seconds)
+    }
+
+    $when = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse(
+            $raw,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal,
+            [ref]$when)) {
+        $delta = [int][Math]::Ceiling(($when - [DateTimeOffset]::UtcNow).TotalSeconds)
+        return [Math]::Max(1, $delta)
+    }
+
+    return $null
+}
+
+function Read-ResponseText {
+    param(
+        $Response,
+        [int]$Max = 2000
+    )
+
+    if ($null -eq $Response -or $null -eq $Response.Content) {
+        return ''
+    }
+
+    $text = [string]$Response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ''
+    }
+
+    $text = ($text -replace '\s+', ' ').Trim()
+    if ($text.Length -gt $Max) {
+        return $text.Substring(0, $Max)
+    }
+
+    return $text
+}
+
+function Get-JwtExpiryUtc {
+    param([string]$Jwt)
+
+    try {
+        $part = $Jwt.Split('.')[1].Replace('-', '+').Replace('_', '/')
+        switch ($part.Length % 4) {
+            2 { $part += '==' }
+            3 { $part += '=' }
+        }
+
+        $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($part))
+        $doc = [System.Text.Json.JsonDocument]::Parse($json)
+        try {
+            return [DateTimeOffset]::FromUnixTimeSeconds(
+                $doc.RootElement.GetProperty('exp').GetInt64()
+            ).UtcDateTime
+        }
+        finally {
+            $doc.Dispose()
+        }
+    }
+    catch {
+        return [DateTime]::UtcNow.AddMinutes(45)
+    }
+}
+
+function Update-GraphBearer {
+    $params = @{
+        Method      = 'GET'
+        Uri         = 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=1&$select=id'
+        OutputType  = 'HttpResponseMessage'
+        Headers     = @{ Prefer = 'include-unknown-enum-members' }
+        ErrorAction = 'Stop'
+    }
+
+    $command = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
+    if ($command.Parameters.ContainsKey('SkipHttpErrorCheck')) {
+        $params.SkipHttpErrorCheck = $true
+    }
+
+    $response = Invoke-MgGraphRequest @params
+    try {
+        if ($response -isnot [System.Net.Http.HttpResponseMessage]) {
+            throw 'Update Microsoft.Graph.Authentication. Invoke-MgGraphRequest must support -OutputType HttpResponseMessage so the script can reuse the session token.'
+        }
+
+        $authorization = $response.RequestMessage.Headers.Authorization
+        if ($null -eq $authorization -or [string]::IsNullOrWhiteSpace($authorization.Parameter)) {
+            throw 'The Graph session did not attach a bearer token to the probe request.'
+        }
+
+        $code = [int]$response.StatusCode
+        if ($code -ge 400) {
+            $detail = Read-ResponseText $response 800
+            throw "Graph sign-in probe failed with HTTP $code. $detail"
+        }
+
+        $script:Token = $authorization.Parameter
+        $script:TokenExpiresUtc = Get-JwtExpiryUtc $script:Token
+    }
+    finally {
+        $response.Dispose()
+    }
+}
+
+function New-GraphRequest {
+    param([Parameter(Mandatory)][string]$Uri)
+
+    if ([DateTime]::UtcNow -gt $script:TokenExpiresUtc.AddMinutes(-5)) {
+        Update-GraphBearer
+    }
+
+    $request = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Get,
+        $Uri
+    )
+    $request.Version = [Version]::new(2, 0)
+    # HttpRequestMessage.VersionPolicy arrived in .NET 5. PowerShell 7.0 is
+    # still on .NET Core 3.1, including some older macOS installs.
+    if ([System.Net.Http.HttpRequestMessage].GetProperty('VersionPolicy')) {
+        $request.VersionPolicy = [System.Net.Http.HttpVersionPolicy]::RequestVersionOrLower
+    }
+    $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new(
+        'Bearer',
+        $script:Token
+    )
+    [void]$request.Headers.TryAddWithoutValidation(
+        'Prefer',
+        'include-unknown-enum-members, odata.maxpagesize=1000'
+    )
+    $request.Headers.Accept.Add(
+        [System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new('application/json')
+    )
+    return $request
+}
+
+function Open-SliceWriter {
+    param($Slice)
+
+    if ($null -eq $Slice.Writer) {
+        $encoding = [Text.UTF8Encoding]::new($false)
+        $Slice.Writer = [IO.StreamWriter]::new($Slice.PartFile, $false, $encoding, 65536)
+        $Slice.Writer.NewLine = "`r`n"
+    }
+}
+
+function Close-SliceWriter {
+    param($Slice)
+
+    if ($null -ne $Slice.Writer) {
+        $Slice.Writer.Flush()
+        $Slice.Writer.Dispose()
+        $Slice.Writer = $null
+    }
+}
+
+function Clear-IncompleteSlice {
+    param($Slice)
+
+    if ($Slice.Done) {
+        return
+    }
+
+    Close-SliceWriter $Slice
+    Remove-Item -LiteralPath $Slice.PartFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Slice.DoneFile -Force -ErrorAction SilentlyContinue
+}
+
+function Complete-Slice {
+    param($Slice)
+
+    Close-SliceWriter $Slice
+    if ($Slice.Matched -eq 0) {
+        Remove-Item -LiteralPath $Slice.PartFile -Force -ErrorAction SilentlyContinue
+    }
+
+    [IO.File]::WriteAllText(
+        $Slice.DoneFile,
+        ("scanned={0}`nmatched={1}`n" -f $Slice.Scanned, $Slice.Matched),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $Slice.Done = $true
+    $Slice.Busy = $false
+    $script:CompletedSlices++
+}
+
+function Read-DoneMeta {
+    param([string]$Path)
+
+    $scanned = [long]0
+    $matched = [long]0
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^scanned=(\d+)$') {
+            $scanned = [long]$Matches[1]
+        }
+        elseif ($line -match '^matched=(\d+)$') {
+            $matched = [long]$Matches[1]
+        }
+    }
+
+    return [pscustomobject]@{
+        Scanned = $scanned
+        Matched = $matched
+    }
+}
+
+function Import-SignInResponse {
+    param($Slice, $Response)
+
+    $pageWriter = [IO.StringWriter]::new()
+    $pageWriter.NewLine = "`r`n"
+    $stream = $Response.Content.ReadAsStream()
+    try {
+        $cursor = [PageCursor]::new()
+        $cursor.HeaderWritten = [bool]$Slice.HeaderWritten
+        [SignInPageReader]::Consume(
+            $stream,
+            $pageWriter,
+            $cursor,
+            $script:ResultSet,
+            ([string]$PolicyId),
+            ([string]$PolicyName),
+            [bool]$Diagnose,
+            $script:ResultTally,
+            $script:SamplePolicies
+        )
+
+        $text = $pageWriter.ToString()
+        if ($text.Length -gt 0) {
+            Open-SliceWriter $Slice
+            $Slice.Writer.Write($text)
+            $Slice.Writer.Flush()
+        }
+
+        $Slice.HeaderWritten = [bool]$cursor.HeaderWritten
+        $Slice.Scanned += $cursor.Scanned
+        $Slice.Matched += $cursor.Matched
+        $script:TotalScanned += $cursor.Scanned
+        $script:TotalMatched += $cursor.Matched
+        if ($cursor.SawPolicies) {
+            $script:SawPolicies = $true
+        }
+
+        $script:CheckedVisibility += $cursor.Scanned
+        $Slice.Page++
+        $Slice.Uri = $cursor.NextLink
+        if ([string]::IsNullOrWhiteSpace([string]$Slice.Uri)) {
+            $Slice.Uri = $null
+        }
+    }
+    finally {
+        $stream.Dispose()
+        $pageWriter.Dispose()
+    }
+}
+
+function Show-RunProgress {
+    $elapsed = $script:Stopwatch.Elapsed.TotalSeconds
+    $rate = if ($elapsed -gt 0) { $script:TotalScanned / $elapsed } else { 0 }
+    Write-Host (
+        "`r  in-flight {0,-2} scanned {1,-9} matched {2,-6} {3,6:N0} rec/s   " -f
+        $script:InFlight.Count,
+        $script:TotalScanned,
+        $script:TotalMatched,
+        $rate
+    ) -NoNewline
+}
+
+function Show-SliceDone {
+    param($Slice)
+
+    $total = $script:AllSlices.Count
+    $percent = if ($total -gt 0) {
+        [int](($script:CompletedSlices / $total) * 100)
+    }
+    else {
+        100
+    }
+
+    $finishedNow = $script:CompletedSlices - $script:ResumedSlices
+    $eta = if ($finishedNow -gt 0) {
+        [TimeSpan]::FromSeconds(
+            ($script:Stopwatch.Elapsed.TotalSeconds / $finishedNow) *
+            ($total - $script:CompletedSlices)
+        )
+    }
+    else {
+        [TimeSpan]::Zero
+    }
+
+    $fromText = if ($Slice.From.Length -ge 13) { $Slice.From.Substring(0, 13) } else { $Slice.From }
+    Write-Host (
+        "`rslice {0,-3} {1} scanned {2,-9} matched {3,-6} [{4,3}%] ETA {5:hh\:mm\:ss}   " -f
+        $Slice.Index,
+        $fromText,
+        $Slice.Scanned,
+        $Slice.Matched,
+        $percent,
+        $eta
+    )
+}
+
+function Update-VisibilityNotice {
+    if ($script:SamplePrinted -or $script:SamplePolicies.Count -eq 0) {
+        return
+    }
+
+    $script:SamplePrinted = $true
+    Write-Host (
+        "CA data visible. Sample report-only policies: {0}" -f
+        ($script:SamplePolicies -join ', ')
+    ) -ForegroundColor Green
+}
+
+function Update-MissingCaNotice {
+    if ($script:WarnedCa -or $script:SawPolicies -or $script:CheckedVisibility -lt 50) {
+        return
+    }
+
+    $script:WarnedCa = $true
+    Write-Warning 'appliedConditionalAccessPolicies was empty on the first 50 sign-ins.'
+    Write-Warning 'The account may read sign-ins but lack a role that can read Conditional Access data.'
+}
+
+function Update-InFlightHint {
+    if ($script:HintedInFlight -or $script:LatencyCount -lt 3 -or $script:IntervalSeconds -le 0) {
+        return
+    }
+
+    $average = $script:LatencyTotal / $script:LatencyCount
+    $needed = [int][Math]::Ceiling($average / $script:IntervalSeconds)
+    if ($needed -gt $MaxInFlight) {
+        $script:HintedInFlight = $true
+        Write-Warning (
+            'Average page latency is {0:N1}s. -MaxInFlight {1} would fill the {2:N2}s request spacing. The current cap is {3}.' -f
+            $average,
+            [Math]::Min(12, $needed),
+            $script:IntervalSeconds,
+            $MaxInFlight
+        )
+    }
+}
+
+function Receive-GraphJob {
+    param($Job)
+
+    $slice = $Job.Slice
+    $script:LatencyTotal += ([DateTime]::UtcNow - $Job.Started).TotalSeconds
+    $script:LatencyCount++
+
+    $response = $null
+    try {
+        if ($Job.Task.IsCanceled -or $Job.Task.IsFaulted) {
+            $slice.Retries++
+            $message = 'The Graph request failed before a response arrived.'
+            if ($Job.Task.IsFaulted -and $null -ne $Job.Task.Exception) {
+                $message = $Job.Task.Exception.GetBaseException().Message
+            }
+
+            if ($slice.Retries -gt 12) {
+                throw "Slice $($slice.Index) failed after $($slice.Retries) attempts. $message"
+            }
+
+            Write-Warning "Slice $($slice.Index) request failed ($message). Retry $($slice.Retries)."
+            $script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds([Math]::Min(30, 2 * $slice.Retries))
+            $slice.Busy = $false
+            $script:Ready.Push($slice)
+            return
+        }
+
+        $response = $Job.Task.Result
+        $status = [int]$response.StatusCode
+
+        if ($status -eq 200) {
+            $script:QueryModeLocked = $true
+            try {
+                Import-SignInResponse -Slice $slice -Response $response
+            }
+            catch {
+                $slice.Retries++
+                if ($slice.Retries -gt 12) {
+                    throw
+                }
+
+                Write-Warning "Slice $($slice.Index) page could not be read ($($_.Exception.Message)). Retry $($slice.Retries)."
+                $script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds([Math]::Min(30, 2 * $slice.Retries))
+                $slice.Busy = $false
+                $script:Ready.Push($slice)
+                return
+            }
+
+            $slice.Retries = 0
+            $slice.AuthRetried = $false
+            $script:SuccessStreak++
+            if ($script:SuccessStreak -ge 30 -and $script:IntervalSeconds -gt ($script:FastestInterval + 0.05)) {
+                $script:IntervalSeconds = [Math]::Max(
+                    $script:FastestInterval,
+                    $script:IntervalSeconds * 0.9
+                )
+                $script:SuccessStreak = 0
+            }
+
+            Show-RunProgress
+            Update-VisibilityNotice
+            Update-MissingCaNotice
+            Update-InFlightHint
+
+            if ([string]::IsNullOrWhiteSpace([string]$slice.Uri)) {
+                Complete-Slice $slice
+                Show-SliceDone $slice
+            }
+            else {
+                $slice.Busy = $false
+                $script:Ready.Push($slice)
+            }
+
+            return
+        }
+
+        if ($status -in 429, 503, 504) {
+            $script:Throttles++
+            $script:SuccessStreak = 0
+            $retryAfter = Get-RetryAfterSeconds $response
+            if (-not $retryAfter) {
+                $retryAfter = if ($status -eq 503) { 15 } else { 10 }
+            }
+
+            $script:IntervalSeconds = [Math]::Min($script:IntervalSeconds * 1.5, 30)
+            $script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $retryAfter))
+            $slice.Retries++
+            if ($slice.Retries -gt 12) {
+                throw "Slice $($slice.Index) received HTTP $status on $($slice.Retries) attempts."
+            }
+
+            Write-Warning (
+                'HTTP {0} on slice {1}; retry in {2}s; pace now {3:N2}s/request' -f
+                $status,
+                $slice.Index,
+                $retryAfter,
+                $script:IntervalSeconds
+            )
+            $slice.Busy = $false
+            $script:Ready.Push($slice)
+            return
+        }
+
+        if ($status -eq 401 -and -not $slice.AuthRetried) {
+            $slice.AuthRetried = $true
+            Update-GraphBearer
+            $slice.Busy = $false
+            $script:Ready.Push($slice)
+            return
+        }
+
+        $body = Read-ResponseText $response 2000
+        if ($status -eq 400 -and $slice.Page -eq 0 -and (Update-QueryMode $body)) {
+            $slice.Uri = New-SignInUri -Filter (Get-SliceFilter $slice)
+            $slice.Busy = $false
+            $script:Ready.Push($slice)
+            return
+        }
+
+        throw "Slice $($slice.Index), page $($slice.Page + 1) failed with HTTP $status. $body"
+    }
+    finally {
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
+
+        try {
+            $Job.Request.Dispose()
+        }
+        catch {
+        }
+    }
+}
+
+function Invoke-QueryProbe {
+    $slice = $script:PendingSlices[0]
+    $uri = New-SignInUri -Filter (Get-SliceFilter $slice) -Top 1
+
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        while ([DateTime]::UtcNow -lt $script:NextAllowedUtc) {
+            $waitMs = [int][Math]::Ceiling(
+                ($script:NextAllowedUtc - [DateTime]::UtcNow).TotalMilliseconds
+            )
+            if ($waitMs -gt 0) {
+                Start-Sleep -Milliseconds ([Math]::Min($waitMs, 1000))
+            }
+        }
+
+        $request = New-GraphRequest -Uri $uri
+        $script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds($script:IntervalSeconds)
+        $script:Requests++
+        $task = $script:Http.SendAsync(
+            $request,
+            [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+            $script:Cancel.Token
+        )
+        $response = $null
+        try {
+            try {
+                $response = $task.GetAwaiter().GetResult()
+            }
+            catch {
+                $script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds([Math]::Min(30, 2 * $attempt))
+                Write-Warning "Query probe failed ($($_.Exception.Message)). Retry $attempt."
+                continue
+            }
+
+            $status = [int]$response.StatusCode
+            if ($status -eq 200) {
+                $script:QueryModeLocked = $true
+                return
+            }
+
+            if ($status -in 429, 503, 504) {
+                $script:Throttles++
+                $retryAfter = Get-RetryAfterSeconds $response
+                if (-not $retryAfter) {
+                    $retryAfter = if ($status -eq 503) { 15 } else { 10 }
+                }
+
+                $script:IntervalSeconds = [Math]::Min($script:IntervalSeconds * 1.5, 30)
+                $script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds($retryAfter)
+                Write-Warning "HTTP $status on the query probe; retrying in ${retryAfter}s."
+                continue
+            }
+
+            if ($status -eq 401 -and -not $script:ProbeAuthRetried) {
+                $script:ProbeAuthRetried = $true
+                Update-GraphBearer
+                continue
+            }
+
+            $body = Read-ResponseText $response 2000
+            if ($status -eq 400 -and (Update-QueryMode $body)) {
+                $uri = New-SignInUri -Filter (Get-SliceFilter $slice) -Top 1
+                continue
+            }
+
+            throw "Graph query probe failed with HTTP $status. $body"
+        }
+        finally {
+            $request.Dispose()
+            if ($null -ne $response) {
+                $response.Dispose()
+            }
+        }
+    }
+
+    throw 'Graph query probe did not succeed.'
+}
+
+function Invoke-SignInDownload {
+    while ($script:Waiting.Count -gt 0 -or $script:Ready.Count -gt 0 -or $script:InFlight.Count -gt 0) {
+        for ($index = $script:InFlight.Count - 1; $index -ge 0; $index--) {
+            $job = $script:InFlight[$index]
+            if (-not $job.Task.IsCompleted) {
+                continue
+            }
+
+            $script:InFlight.RemoveAt($index)
+            Receive-GraphJob $job
+        }
+
+        $now = [DateTime]::UtcNow
+        $sliceToStart = $null
+        if ($now -ge $script:NextAllowedUtc -and $script:InFlight.Count -lt $MaxInFlight) {
+            if ($script:Ready.Count -gt 0) {
+                $sliceToStart = $script:Ready.Pop()
+            }
+            elseif ($script:Waiting.Count -gt 0) {
+                $sliceToStart = $script:Waiting.Dequeue()
+            }
+        }
+
+        if ($null -ne $sliceToStart) {
+            if ([string]::IsNullOrWhiteSpace([string]$sliceToStart.Uri)) {
+                Complete-Slice $sliceToStart
+                Show-SliceDone $sliceToStart
+                continue
+            }
+
+            $sliceToStart.Busy = $true
+            $request = New-GraphRequest -Uri $sliceToStart.Uri
+            $task = $script:Http.SendAsync(
+                $request,
+                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+                $script:Cancel.Token
+            )
+            $script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds($script:IntervalSeconds)
+            $script:Requests++
+            $script:InFlight.Add([pscustomobject]@{
+                    Slice   = $sliceToStart
+                    Task    = $task
+                    Request = $request
+                    Started = [DateTime]::UtcNow
+                })
+            continue
+        }
+
+        if ($script:InFlight.Count -eq 0) {
+            $waitMs = [int][Math]::Ceiling(
+                ($script:NextAllowedUtc - [DateTime]::UtcNow).TotalMilliseconds
+            )
+            if ($waitMs -lt 1) {
+                $waitMs = 1
+            }
+
+            Start-Sleep -Milliseconds ([Math]::Min($waitMs, 1000))
+            continue
+        }
+
+        $tasks = [System.Threading.Tasks.Task[]]::new($script:InFlight.Count)
+        for ($index = 0; $index -lt $script:InFlight.Count; $index++) {
+            $tasks[$index] = $script:InFlight[$index].Task
+        }
+
+        $delayMs = 500
+        if ($script:NextAllowedUtc -gt $now -and
+            $script:InFlight.Count -lt $MaxInFlight -and
+            ($script:Ready.Count -gt 0 -or $script:Waiting.Count -gt 0)) {
+            $untilSlot = [int][Math]::Ceiling(
+                ($script:NextAllowedUtc - [DateTime]::UtcNow).TotalMilliseconds
+            )
+            if ($untilSlot -lt 1) {
+                $untilSlot = 1
+            }
+
+            if ($untilSlot -lt $delayMs) {
+                $delayMs = $untilSlot
+            }
+        }
+
+        [void][System.Threading.Tasks.Task]::WaitAny($tasks, $delayMs)
+    }
+}
+
+function Write-SlicePlan {
+    param([string]$Directory)
+
+    $payload = [ordered]@{
+        Results         = @($Results)
+        PolicyId        = [string]$PolicyId
+        PolicyName      = [string]$PolicyName
+        InteractiveOnly = [bool]$InteractiveOnly
+        StartUtc        = $script:WindowStart
+        EndUtc          = $script:WindowEnd
+        Slices          = @(
+            foreach ($slice in $script:AllSlices) {
+                [ordered]@{
+                    Index = $slice.Index
+                    From  = $slice.From
+                    To    = $slice.To
+                }
+            }
+        )
+    }
+
+    $target = Join-Path $Directory 'slices.json'
+    $temp = "$target.tmp"
+    [IO.File]::WriteAllText(
+        $temp,
+        ($payload | ConvertTo-Json -Depth 6),
+        [Text.UTF8Encoding]::new($false)
+    )
+    if (Test-Path -LiteralPath $target) {
+        Remove-Item -LiteralPath $target -Force
+    }
+
+    [IO.File]::Move($temp, $target)
+}
+
+function Test-PlanFilter {
+    param($Plan)
+
+    $planResults = @($Plan.Results | ForEach-Object { [string]$_ })
+    if ($planResults.Count -ne @($Results).Count) {
+        return $false
+    }
+
+    $wanted = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($result in $Results) {
+        [void]$wanted.Add([string]$result)
+    }
+
+    foreach ($result in $planResults) {
+        if (-not $wanted.Contains($result)) {
+            return $false
+        }
+    }
+
+    if (-not [string]::Equals([string]$Plan.PolicyId, [string]$PolicyId, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    if (-not [string]::Equals([string]$Plan.PolicyName, [string]$PolicyName, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    if ([bool]$Plan.InteractiveOnly -ne [bool]$InteractiveOnly) {
+        return $false
+    }
+
+    return $true
+}
+
+function New-SliceObject {
+    param(
+        [int]$Index,
+        [string]$From,
+        [string]$To
+    )
+
+    $partFile = Join-Path $PartDir ('part_{0:d4}.csv' -f $Index)
+    return [pscustomobject]@{
+        Index          = $Index
+        From           = $From
+        To             = $To
+        Uri            = $null
+        PartFile       = $partFile
+        DoneFile       = "$partFile.done"
+        Writer         = $null
+        HeaderWritten  = $false
+        Scanned        = [long]0
+        Matched        = [long]0
+        Page           = 0
+        AuthRetried    = $false
+        Retries        = 0
+        Busy           = $false
+        Done           = $false
+    }
+}
+
+function New-SliceList {
+    param(
+        [Parameter(Mandatory)][DateTime]$StartUtc,
+        [Parameter(Mandatory)][DateTime]$EndUtc,
+        [Parameter(Mandatory)][TimeSpan]$SliceLength
+    )
+
+    $list = [System.Collections.Generic.List[object]]::new()
+    $cursorEnd = $EndUtc
+    $index = 0
+    while ($cursorEnd -gt $StartUtc) {
+        $cursorStart = $cursorEnd - $SliceLength
+        if ($cursorStart -lt $StartUtc) {
+            $cursorStart = $StartUtc
+        }
+
+        # Adjacent slices share the same formatted timestamp, so a sign-in on
+        # the boundary is counted once.
+        $fromText = ConvertTo-GraphUtc $cursorStart
+        $toText = ConvertTo-GraphUtc $cursorEnd
+        $list.Add((New-SliceObject -Index $index -From $fromText -To $toText))
+        $index++
+        $cursorEnd = $cursorStart
+    }
+
+    return $list
+}
+
+function Merge-PartFiles {
+    param([string]$Destination)
+
+    # Only the slices in this run's plan. A reused part directory can contain
+    # part files from an older window, and those must not land in the CSV.
+    $parts = @(
+        $script:AllSlices |
+            Sort-Object Index |
+            Where-Object {
+                (Test-Path -LiteralPath $_.PartFile) -and (Test-Path -LiteralPath $_.DoneFile)
+            }
+    )
+
+    if ($parts.Count -eq 0) {
+        return $false
+    }
+
+    $writer = [IO.StreamWriter]::new(
+        $Destination,
+        $false,
+        [Text.UTF8Encoding]::new($true),
+        1048576
+    )
+    $writer.NewLine = "`r`n"
+    try {
+        $headerWritten = $false
+        foreach ($part in $parts) {
+            $reader = [IO.StreamReader]::new($part.PartFile, [Text.UTF8Encoding]::new($false), $true)
+            try {
+                $header = $reader.ReadLine()
+                if (-not $headerWritten -and $header) {
+                    $writer.WriteLine($header)
+                    $headerWritten = $true
+                }
+
+                while ($null -ne ($line = $reader.ReadLine())) {
+                    $writer.WriteLine($line)
+                }
+            }
+            finally {
+                $reader.Dispose()
+            }
+        }
+    }
+    finally {
+        $writer.Dispose()
+    }
+
+    return $true
+}
+
+function Invoke-SelfTest {
+    $culture = [Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        # A custom separator stands in for locales used on macOS (fi, it, sv)
+        # where an unquoted ':' in a DateTime format becomes '.'.
+        $custom = [Globalization.CultureInfo]::InvariantCulture.Clone()
+        $custom.DateTimeFormat.TimeSeparator = '.'
+        $custom.DateTimeFormat.DateSeparator = '.'
+        [Threading.Thread]::CurrentThread.CurrentCulture = $custom
+        $moment = [DateTime]::new(2026, 11, 23, 15, 4, 5, 123, [DateTimeKind]::Utc).AddTicks(4560)
+        $formatted = ConvertTo-GraphUtc $moment
+        if ($formatted -cne '2026-11-23T15:04:05.1234560Z') {
+            throw "UTC format changed under a non-colon time separator: $formatted"
+        }
+    }
+    finally {
+        [Threading.Thread]::CurrentThread.CurrentCulture = $culture
+    }
+
+    $json = @'
+{
+  "value": [
+    {
+      "id": "signin-1",
+      "createdDateTime": "2026-11-23T15:04:05Z",
+      "userPrincipalName": "Ada@contoso.com",
+      "userDisplayName": "Ada Lovelace",
+      "appDisplayName": "Azure Virtual Desktop",
+      "resourceDisplayName": "Windows Virtual Desktop",
+      "clientAppUsed": "Browser",
+      "isInteractive": false,
+      "ipAddress": "203.0.113.10",
+      "correlationId": "corr-1",
+      "location": null,
+      "deviceDetail": {
+        "displayName": "ADA-PC",
+        "deviceId": "device-1",
+        "operatingSystem": "Windows",
+        "browser": "Edge",
+        "trustType": "AzureAD",
+        "isCompliant": false,
+        "isManaged": true
+      },
+      "status": { "errorCode": 0, "failureReason": "Need \"MFA\",\nnow" },
+      "appliedConditionalAccessPolicies": [
+        {
+          "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+          "displayName": "AVD Require compliant device",
+          "result": "reportOnlyFailure",
+          "enforcedGrantControls": ["Mfa", "CompliantDevice"],
+          "enforcedSessionControls": ["SignInFrequency"]
+        },
+        {
+          "id": "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee",
+          "displayName": "Something else",
+          "result": "reportOnlyFailure",
+          "enforcedGrantControls": [],
+          "enforcedSessionControls": []
+        },
+        {
+          "id": "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee",
+          "displayName": "AVD other",
+          "result": "reportOnlySuccess",
+          "enforcedGrantControls": null,
+          "enforcedSessionControls": []
+        }
+      ]
+    },
+    {
+      "id": "signin-2",
+      "createdDateTime": "2026-11-23T15:00:00Z",
+      "userPrincipalName": "Bob@contoso.com",
+      "userDisplayName": "Bob",
+      "appDisplayName": "Office",
+      "appliedConditionalAccessPolicies": []
+    },
+    {
+      "id": "signin-3",
+      "createdDateTime": "2026-11-23T14:00:00Z",
+      "userPrincipalName": "ada@contoso.com",
+      "userDisplayName": "Ada",
+      "appDisplayName": "Office",
+      "location": { "city": "Helsinki", "state": null, "countryOrRegion": "FI" },
+      "status": null,
+      "deviceDetail": null,
+      "appliedConditionalAccessPolicies": [
+        {
+          "id": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+          "displayName": "AVD Require compliant device",
+          "result": "reportOnlyFailure",
+          "enforcedGrantControls": ["Block"],
+          "enforcedSessionControls": []
+        }
+      ]
+    }
+  ],
+  "@odata.nextLink": "https://graph.microsoft.com/v1.0/auditLogs/signIns?$skiptoken=abc"
+}
+'@
+
+    $results = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    [void]$results.Add('reportOnlyFailure')
+    $tally = [System.Collections.Generic.Dictionary[string, long]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    $samples = [System.Collections.Generic.List[string]]::new()
+    $cursor = [PageCursor]::new()
+    $writer = [IO.StringWriter]::new()
+    $writer.NewLine = "`r`n"
+    $stream = [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($json))
+    try {
+        [SignInPageReader]::Consume(
+            $stream,
+            $writer,
+            $cursor,
+            $results,
+            'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE',
+            'AVD',
+            $true,
+            $tally,
+            $samples
+        )
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    if ($cursor.Scanned -ne 3 -or $cursor.Matched -ne 2) {
+        throw "Expected 3 scanned and 2 matched, got $($cursor.Scanned) and $($cursor.Matched)."
+    }
+
+    if ($cursor.NextLink -ne 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$skiptoken=abc') {
+        throw "Next link was [$($cursor.NextLink)]."
+    }
+
+    if (-not $cursor.SawPolicies) {
+        throw 'Policy arrays were not observed.'
+    }
+
+    $expected = @(
+        'SignInTime,User,DisplayName,App,Resource,ClientApp,IsInteractive,PolicyName,PolicyId,PolicyResult,GrantControls,SessionControls,IPAddress,City,State,Country,DeviceName,DeviceId,OS,Browser,TrustType,IsCompliant,IsManaged,ActualErrorCode,ActualFailReason,CorrelationId,SignInId'
+        '2026-11-23T15:04:05Z,Ada@contoso.com,Ada Lovelace,Azure Virtual Desktop,Windows Virtual Desktop,Browser,False,AVD Require compliant device,aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,reportOnlyFailure,Mfa; CompliantDevice,SignInFrequency,203.0.113.10,,,,ADA-PC,device-1,Windows,Edge,AzureAD,False,True,0,"Need ""MFA"", now",corr-1,signin-1'
+        '2026-11-23T14:00:00Z,ada@contoso.com,Ada,Office,,,,AVD Require compliant device,AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE,reportOnlyFailure,Block,,,Helsinki,,FI,,,,,,,,,,,signin-3'
+    ) -join "`r`n"
+
+    $actual = $writer.ToString().TrimEnd("`r", "`n")
+    if ($actual -cne $expected) {
+        throw "CSV mismatch.`nACTUAL:`n$actual`nEXPECTED:`n$expected"
+    }
+
+    if ($tally['AVD other | reportOnlySuccess'] -ne 1) {
+        throw 'Diagnose tally missed reportOnlySuccess.'
+    }
+
+    if ($samples -notcontains 'AVD Require compliant device') {
+        throw 'Sample policy names were not collected.'
+    }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ('ca-selftest-' + [guid]::NewGuid().ToString('n') + '.csv')
+    try {
+        [IO.File]::WriteAllText($temp, $writer.ToString(), [Text.UTF8Encoding]::new($true))
+        $rollups = @([SignInPageReader]::Summarize($temp))
+        if ($rollups.Count -ne 1) {
+            throw "Expected one policy rollup, got $($rollups.Count)."
+        }
+
+        if ($rollups[0].Events -ne 2 -or $rollups[0].UniqueUsers -ne 1) {
+            throw "Rollup was $($rollups[0].Events) events and $($rollups[0].UniqueUsers) users."
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        $writer.Dispose()
+    }
+
+    $emptyCursor = [PageCursor]::new()
+    $emptyWriter = [IO.StringWriter]::new()
+    $emptyStream = [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('{ "value": [] }'))
+    try {
+        [SignInPageReader]::Consume(
+            $emptyStream,
+            $emptyWriter,
+            $emptyCursor,
+            $results,
+            '',
+            '',
+            $false,
+            $tally,
+            $samples
+        )
+    }
+    finally {
+        $emptyStream.Dispose()
+        $emptyWriter.Dispose()
+    }
+
+    if ($null -ne $emptyCursor.NextLink -or $emptyCursor.Scanned -ne 0) {
+        throw 'An empty page should end the chain.'
+    }
+
+    Write-Host 'SelfTest passed.' -ForegroundColor Green
+}
+
+if ($SelfTest) {
+    Invoke-SelfTest
+    return
+}
+
+$script:SelectList = 'id,createdDateTime,userPrincipalName,userDisplayName,appDisplayName,resourceDisplayName,clientAppUsed,isInteractive,appliedConditionalAccessPolicies,ipAddress,location,deviceDetail,status,correlationId'
+$script:UseSelect = $true
+$script:ServerFilterMode = 'Full'
+$script:QueryModeLocked = $false
+$script:PolicyGuid = ''
+$parsedGuid = [guid]::Empty
+if ($PolicyId -and [guid]::TryParse($PolicyId, [ref]$parsedGuid)) {
+    $script:PolicyGuid = $parsedGuid.ToString('D')
+}
+
+$script:ResultSet = [System.Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+)
+foreach ($resultName in $Results) {
+    [void]$script:ResultSet.Add([string]$resultName)
+}
+
+$script:ResultTally = [System.Collections.Generic.Dictionary[string, long]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+)
+$script:SamplePolicies = [System.Collections.Generic.List[string]]::new()
+$script:IntervalSeconds = 10.0 / $RequestsPer10Sec
+$script:FastestInterval = $script:IntervalSeconds
+$script:NextAllowedUtc = [DateTime]::UtcNow
+$script:Requests = 0
+$script:Throttles = 0
+$script:SuccessStreak = 0
+$script:TotalScanned = [long]0
+$script:TotalMatched = [long]0
+$script:ResumedScanned = [long]0
+$script:ResumedMatched = [long]0
+$script:ResumedSlices = 0
+$script:CompletedSlices = 0
+$script:SawPolicies = $false
+$script:CheckedVisibility = [long]0
+$script:WarnedCa = $false
+$script:SamplePrinted = $false
+$script:HintedInFlight = $false
+$script:LatencyTotal = 0.0
+$script:LatencyCount = 0
+$script:ProbeAuthRetried = $false
+$script:TokenExpiresUtc = [DateTime]::UtcNow
+$script:Cancel = [System.Threading.CancellationTokenSource]::new()
+$script:InFlight = [System.Collections.Generic.List[object]]::new()
+$script:Ready = [System.Collections.Generic.Stack[object]]::new()
+$script:Waiting = [System.Collections.Generic.Queue[object]]::new()
+
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
     throw @'
 Microsoft.Graph.Authentication is not installed.
@@ -102,495 +1731,256 @@ if (-not $context) {
 }
 
 Write-Host "Authenticated as: $($context.Account)" -ForegroundColor Green
-#endregion
+Update-GraphBearer
+$script:NextAllowedUtc = [DateTime]::UtcNow.AddSeconds($script:IntervalSeconds)
 
-#region ---------- Matching helpers ----------
-$resultSet = [System.Collections.Generic.HashSet[string]]::new(
-    [System.StringComparer]::OrdinalIgnoreCase
-)
-foreach ($result in $Results) {
-    [void]$resultSet.Add($result)
-}
-
-function Test-PolicyNameMatch {
-    param(
-        [AllowNull()][string]$Candidate,
-        [AllowNull()][string]$Requested
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Requested)) {
-        return $true
-    }
-
-    if ([string]::IsNullOrEmpty($Candidate)) {
-        return $false
-    }
-
-    return $Candidate.IndexOf(
-        $Requested,
-        [System.StringComparison]::OrdinalIgnoreCase
-    ) -ge 0
-}
-#endregion
-
-#region ---------- Pacer and Graph request wrapper ----------
-$script:MinInterval = 10.0 / $RequestsPer10Sec
-$script:LastCallUtc = [DateTime]::MinValue
-$script:Throttles   = 0
-$script:Requests    = 0
-
-function Get-HttpStatusCode {
-    param([Parameter(Mandatory)]$ErrorRecord)
-
-    try {
-        return [int]$ErrorRecord.Exception.Response.StatusCode
-    }
-    catch {}
-
-    try {
-        return [int]$ErrorRecord.Exception.Response.StatusCode.value__
-    }
-    catch {}
-
-    return $null
-}
-
-function Get-RetryAfterSeconds {
-    param([Parameter(Mandatory)]$ErrorRecord)
-
-    try {
-        $values = $ErrorRecord.Exception.Response.Headers.GetValues('Retry-After')
-        if ($values -and $values[0]) {
-            $seconds = 0
-            if ([int]::TryParse([string]$values[0], [ref]$seconds)) {
-                return [Math]::Max(1, $seconds)
-            }
-
-            $retryDate = [DateTimeOffset]::MinValue
-            if ([DateTimeOffset]::TryParse([string]$values[0], [ref]$retryDate)) {
-                return [Math]::Max(
-                    1,
-                    [int][Math]::Ceiling(($retryDate - [DateTimeOffset]::UtcNow).TotalSeconds)
-                )
-            }
-        }
-    }
-    catch {}
-
-    return $null
-}
-
-function Invoke-PacedGraph {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Uri
-    )
-
-    while ($true) {
-        $elapsed = ([DateTime]::UtcNow - $script:LastCallUtc).TotalSeconds
-        $remaining = $script:MinInterval - $elapsed
-
-        if ($remaining -gt 0) {
-            Start-Sleep -Milliseconds ([int][Math]::Ceiling($remaining * 1000))
-        }
-
-        $script:LastCallUtc = [DateTime]::UtcNow
-        $script:Requests++
-
-        try {
-            return Invoke-MgGraphRequest `
-                -Method GET `
-                -Uri $Uri `
-                -Headers @{ Prefer = 'include-unknown-enum-members' } `
-                -OutputType PSObject `
-                -ErrorAction Stop
-        }
-        catch {
-            $statusCode = Get-HttpStatusCode -ErrorRecord $_
-
-            if ($statusCode -notin 429, 503, 504) {
-                throw
-            }
-
-            $script:Throttles++
-            $retryAfter = Get-RetryAfterSeconds -ErrorRecord $_
-
-            if (-not $retryAfter) {
-                $retryAfter = switch ($statusCode) {
-                    429     { 10 }
-                    503     { 15 }
-                    504     { 10 }
-                    default { 10 }
-                }
-            }
-
-            # Slow future calls after a throttle, but retain a practical upper bound.
-            $script:MinInterval = [Math]::Min($script:MinInterval * 1.25, 10.0)
-
-            Write-Warning (
-                'HTTP {0}; retrying in {1}s; pace now {2:N2}s/request' -f
-                $statusCode,
-                $retryAfter,
-                $script:MinInterval
-            )
-
-            Start-Sleep -Seconds $retryAfter
-        }
-    }
-}
-#endregion
-
-#region ---------- Preflight ----------
-Write-Host 'Preflight: checking Conditional Access data visibility...' -ForegroundColor Cyan
-$probe = Invoke-PacedGraph -Uri 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=50'
-$withCa = @($probe.value | Where-Object {
-    $_.appliedConditionalAccessPolicies -and
-    $_.appliedConditionalAccessPolicies.Count -gt 0
-})
-
-if ($withCa.Count -eq 0) {
-    Write-Warning 'appliedConditionalAccessPolicies was empty on all 50 sample records.'
-    Write-Warning 'The account may read sign-ins but lack a role that can read Conditional Access data.'
-}
-else {
-    $samplePolicies = @(
-        $withCa.appliedConditionalAccessPolicies |
-            Where-Object { $_.result -like 'reportOnly*' } |
-            Select-Object -ExpandProperty displayName -Unique
-    )
-
-    $sampleText = if ($samplePolicies.Count) {
-        $samplePolicies -join ', '
-    }
-    else {
-        '(none observed in the 50-record sample)'
-    }
-
-    Write-Host "CA data visible. Sample report-only policies: $sampleText" -ForegroundColor Green
-}
-#endregion
-
-#region ---------- Output paths and newest-first slices ----------
-$outFullPath = [IO.Path]::GetFullPath($OutFile)
+$outFullPath = Resolve-UserPath $OutFile
 $outParent = Split-Path -Parent $outFullPath
 if (-not (Test-Path -LiteralPath $outParent)) {
     New-Item -ItemType Directory -Path $outParent -Force | Out-Null
 }
 
-$endUtc   = [DateTime]::UtcNow
-$startUtc = $endUtc.AddDays(-$Days)
-
 if (-not $PartDir) {
-    $PartDir = Join-Path $outParent "careportonly_parts_$(Get-Date -Format yyyyMMdd_HHmmss)"
+    $PartDir = Join-Path $outParent ('careportonly_parts_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
-$PartDir = [IO.Path]::GetFullPath($PartDir)
+
+$PartDir = Resolve-UserPath $PartDir
 New-Item -ItemType Directory -Path $PartDir -Force | Out-Null
 
-$slices = [System.Collections.Generic.List[object]]::new()
-$cursorEnd = $endUtc
-$index = 0
-
-while ($cursorEnd -gt $startUtc) {
-    $cursorStart = $cursorEnd.AddHours(-$SliceHours)
-    if ($cursorStart -lt $startUtc) {
-        $cursorStart = $startUtc
+$planPath = Join-Path $PartDir 'slices.json'
+$plan = $null
+if ($Resume -and (Test-Path -LiteralPath $planPath)) {
+    $plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
+    if (-not (Test-PlanFilter $plan)) {
+        throw "The slice plan in $planPath was built for a different -Results, -PolicyId, -PolicyName, or -InteractiveOnly value. Use a new -PartDir, or resume with the same filters."
     }
-
-    $slices.Add([pscustomobject]@{
-        Index = $index
-        From  = $cursorStart.ToString('yyyy-MM-ddTHH:mm:ssZ')
-        To    = $cursorEnd.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    })
-
-    $index++
-    $cursorEnd = $cursorStart
 }
 
-Write-Host "`nWindow : $($startUtc.ToString('u')) -> $($endUtc.ToString('u'))" -ForegroundColor Cyan
-Write-Host "Slices : $($slices.Count) x up to ${SliceHours}h, newest first" -ForegroundColor Cyan
-Write-Host "Pace  : $([Math]::Round($script:MinInterval, 2)) seconds/request" -ForegroundColor Cyan
-Write-Host "Match : $($Results -join ', ')`n" -ForegroundColor Cyan
-#endregion
+if ($plan) {
+    $script:WindowStart = [string]$plan.StartUtc
+    $script:WindowEnd = [string]$plan.EndUtc
+    $script:AllSlices = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @($plan.Slices)) {
+        $script:AllSlices.Add((New-SliceObject -Index ([int]$item.Index) -From ([string]$item.From) -To ([string]$item.To)))
+    }
 
-#region ---------- Pull and stream each page ----------
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-$totalScanned = 0L
-$totalMatched = 0L
-$resultTally = @{}
-$completedSlices = 0
+    $savedStart = [DateTime]::Parse(
+        $script:WindowStart,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    )
+    $savedEnd = [DateTime]::Parse(
+        $script:WindowEnd,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    )
+    $savedDays = ($savedEnd - $savedStart).TotalDays
+    if ([Math]::Abs($savedDays - $Days) -gt 0.05) {
+        Write-Warning "Resuming the saved window $($script:WindowStart) -> $($script:WindowEnd). -Days $Days is not reapplied."
+    }
+}
+else {
+    if ($Resume) {
+        Write-Warning 'This part directory has no slices.json. Slice boundaries follow the clock from this run. Use a new -PartDir when the earlier run did not record its window.'
+    }
 
-foreach ($slice in $slices) {
-    $partFile = Join-Path $PartDir ('part_{0:d4}.csv' -f $slice.Index)
-    $doneFile = "$partFile.done"
+    $endUtc = [DateTime]::UtcNow
+    $startUtc = $endUtc.AddDays(-$Days)
+    $window = $endUtc - $startUtc
+    $maxSlice = [TimeSpan]::FromHours($SliceHours)
+    $minSlice = [TimeSpan]::FromMinutes(15)
+    $sliceLength = $maxSlice
+    if ($window.Ticks -gt 0) {
+        $countAtMax = [Math]::Ceiling($window.TotalHours / $maxSlice.TotalHours)
+        if ($countAtMax -lt $MaxInFlight) {
+            $sliceLength = [TimeSpan]::FromTicks([long]($window.Ticks / $MaxInFlight))
+            if ($sliceLength -lt $minSlice) {
+                $sliceLength = $minSlice
+            }
+            if ($sliceLength -gt $maxSlice) {
+                $sliceLength = $maxSlice
+            }
+        }
+    }
 
-    if ($Resume -and (Test-Path -LiteralPath $doneFile)) {
-        Write-Host (
-            'slice {0,-3} {1} SKIPPED (complete)' -f
-            $slice.Index,
-            $slice.From.Substring(0, 13)
-        ) -ForegroundColor DarkGreen
+    $script:WindowStart = ConvertTo-GraphUtc $startUtc
+    $script:WindowEnd = ConvertTo-GraphUtc $endUtc
+    $script:AllSlices = New-SliceList -StartUtc $startUtc -EndUtc $endUtc -SliceLength $sliceLength
+    Write-SlicePlan -Directory $PartDir
+}
 
-        $completedSlices++
+if (-not $Resume) {
+    Get-ChildItem -LiteralPath $PartDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'part_*.csv' -or $_.Name -like 'part_*.csv.done' } |
+        Remove-Item -Force
+}
+
+foreach ($slice in $script:AllSlices) {
+    if ($Resume -and (Test-Path -LiteralPath $slice.DoneFile)) {
+        $meta = Read-DoneMeta $slice.DoneFile
+        $script:ResumedScanned += $meta.Scanned
+        $script:ResumedMatched += $meta.Matched
+        $script:ResumedSlices++
+        $script:CompletedSlices++
+        $slice.Done = $true
+        $fromText = if ($slice.From.Length -ge 13) { $slice.From.Substring(0, 13) } else { $slice.From }
+        Write-Host ("slice {0,-3} {1} SKIPPED (complete)" -f $slice.Index, $fromText) -ForegroundColor DarkGreen
         continue
     }
 
-    # A part without a .done marker is incomplete and must not be appended to.
-    Remove-Item -LiteralPath $partFile -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $doneFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $slice.PartFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $slice.DoneFile -Force -ErrorAction SilentlyContinue
+}
 
-    $filter = "createdDateTime ge $($slice.From) and createdDateTime lt $($slice.To)"
-    if ($InteractiveOnly) {
-        $filter += ' and isInteractive eq true'
-    }
+$script:PendingSlices = @($script:AllSlices | Where-Object { -not $_.Done })
+$sliceHoursText = if ($script:AllSlices.Count -gt 0) {
+    $first = $script:AllSlices[0]
+    $fromStamp = [DateTime]::Parse($first.From, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    $toStamp = [DateTime]::Parse($first.To, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    [Math]::Round(($toStamp - $fromStamp).TotalHours, 2)
+}
+else {
+    $SliceHours
+}
 
-    $uri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=1000&$filter=' +
-        [Uri]::EscapeDataString($filter)
+Write-Host "`nWindow : $($script:WindowStart) -> $($script:WindowEnd)" -ForegroundColor Cyan
+Write-Host "Slices : $($script:AllSlices.Count) x up to ${sliceHoursText}h, newest first, $MaxInFlight in flight" -ForegroundColor Cyan
+Write-Host "Pace   : $([Math]::Round($script:IntervalSeconds, 2)) seconds/request (cap $RequestsPer10Sec per 10s)" -ForegroundColor Cyan
+Write-Host "Match  : $($Results -join ', ')`n" -ForegroundColor Cyan
 
-    $scanned = 0L
-    $matched = 0L
-    $page = 0
-    $partInitialized = $false
+$handler = [System.Net.Http.SocketsHttpHandler]::new()
+$decompress = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+if ([enum]::GetNames([System.Net.DecompressionMethods]) -contains 'Brotli') {
+    $decompress = $decompress -bor [System.Net.DecompressionMethods]::Brotli
+}
 
-    try {
-        while ($uri) {
-            $page++
-            $resp = Invoke-PacedGraph -Uri $uri
-            $pageValues = @($resp.value)
-            $scanned += $pageValues.Count
+$handler.AutomaticDecompression = $decompress
+$handler.MaxConnectionsPerServer = [Math]::Max(8, $MaxInFlight)
+$handler.PooledConnectionLifetime = [TimeSpan]::FromMinutes(15)
+if ([System.Net.Http.SocketsHttpHandler].GetProperty('EnableMultipleHttp2Connections')) {
+    $handler.EnableMultipleHttp2Connections = $true
+}
+$script:Http = [System.Net.Http.HttpClient]::new($handler)
+$script:Http.Timeout = [TimeSpan]::FromSeconds(180)
+$script:Stopwatch = [Diagnostics.Stopwatch]::StartNew()
 
-            $pageRows = @(
-                foreach ($signIn in $pageValues) {
-                    foreach ($policy in @($signIn.appliedConditionalAccessPolicies)) {
-                        if ($Diagnose -and $policy.result -like 'reportOnly*') {
-                            $key = "$($policy.displayName) | $($policy.result)"
-                            if ($resultTally.ContainsKey($key)) {
-                                $resultTally[$key]++
-                            }
-                            else {
-                                $resultTally[$key] = 1L
-                            }
-                        }
-
-                        if (-not $resultSet.Contains([string]$policy.result)) {
-                            continue
-                        }
-
-                        if ($PolicyId -and $policy.id -ne $PolicyId) {
-                            continue
-                        }
-
-                        if (-not (Test-PolicyNameMatch `
-                            -Candidate $policy.displayName `
-                            -Requested $PolicyName)) {
-                            continue
-                        }
-
-                        [pscustomobject]@{
-                            SignInTime       = $signIn.createdDateTime
-                            User             = $signIn.userPrincipalName
-                            DisplayName      = $signIn.userDisplayName
-                            App              = $signIn.appDisplayName
-                            Resource         = $signIn.resourceDisplayName
-                            ClientApp        = $signIn.clientAppUsed
-                            IsInteractive    = $signIn.isInteractive
-                            PolicyName       = $policy.displayName
-                            PolicyId         = $policy.id
-                            PolicyResult     = $policy.result
-                            GrantControls    = $policy.enforcedGrantControls -join '; '
-                            SessionControls  = $policy.enforcedSessionControls -join '; '
-                            IPAddress        = $signIn.ipAddress
-                            City             = $signIn.location.city
-                            State            = $signIn.location.state
-                            Country          = $signIn.location.countryOrRegion
-                            DeviceName       = $signIn.deviceDetail.displayName
-                            DeviceId         = $signIn.deviceDetail.deviceId
-                            OS               = $signIn.deviceDetail.operatingSystem
-                            Browser          = $signIn.deviceDetail.browser
-                            TrustType        = $signIn.deviceDetail.trustType
-                            IsCompliant      = $signIn.deviceDetail.isCompliant
-                            IsManaged        = $signIn.deviceDetail.isManaged
-                            ActualErrorCode  = $signIn.status.errorCode
-                            ActualFailReason = $signIn.status.failureReason
-                            CorrelationId    = $signIn.correlationId
-                            SignInId         = $signIn.id
-                        }
-                    }
-                }
-            )
-
-            if ($pageRows.Count) {
-                if ($partInitialized) {
-                    $pageRows | Export-Csv `
-                        -LiteralPath $partFile `
-                        -NoTypeInformation `
-                        -Encoding UTF8 `
-                        -Append
-                }
-                else {
-                    $pageRows | Export-Csv `
-                        -LiteralPath $partFile `
-                        -NoTypeInformation `
-                        -Encoding UTF8
-                    $partInitialized = $true
-                }
-
-                $matched += $pageRows.Count
-            }
-
-            $effectiveScanned = $totalScanned + $scanned
-            $rate = if ($stopwatch.Elapsed.TotalSeconds -gt 0) {
-                $effectiveScanned / $stopwatch.Elapsed.TotalSeconds
-            }
-            else {
-                0
-            }
-
-            Write-Host (
-                "`r  slice {0,-3} page {1,-4} scanned {2,-9} matched {3,-6} {4:N0} rec/s   " -f
-                $slice.Index,
-                $page,
-                $scanned,
-                $matched,
-                $rate
-            ) -NoNewline -ForegroundColor DarkGray
-
-            # The final page does not include @odata.nextLink. Under StrictMode,
-            # direct access to a missing property throws instead of returning $null.
-            $nextLinkProperty = $resp.PSObject.Properties['@odata.nextLink']
-            $uri = if ($null -ne $nextLinkProperty) {
-                [string]$nextLinkProperty.Value
-            }
-            else {
-                $null
-            }
-        }
-
-        # Completion is committed only after the full nextLink chain ends successfully.
-        New-Item -ItemType File -Path $doneFile -Force | Out-Null
-    }
-    catch {
-        Remove-Item -LiteralPath $partFile -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $doneFile -Force -ErrorAction SilentlyContinue
-
-        throw (
-            'Slice {0}, page {1} failed. Incomplete output was removed. {2}' -f
-            $slice.Index,
-            $page,
-            $_.Exception.Message
-        )
-    }
-
-    $totalScanned += $scanned
-    $totalMatched += $matched
-    $completedSlices++
-
-    $percent = [int](($completedSlices / $slices.Count) * 100)
-    $eta = if ($completedSlices -gt 0) {
-        [TimeSpan]::FromSeconds(
-            ($stopwatch.Elapsed.TotalSeconds / $completedSlices) *
-            ($slices.Count - $completedSlices)
-        )
+try {
+    if ($script:PendingSlices.Count -eq 0) {
+        Write-Host 'All slices are already complete.' -ForegroundColor DarkGreen
     }
     else {
-        [TimeSpan]::Zero
+        Invoke-QueryProbe
+        $mode = switch ($script:ServerFilterMode) {
+            'Full' { 'server-side report-only filter' }
+            'IdOnly' { 'server-side policy id filter' }
+            default { 'local match across every sign-in' }
+        }
+
+        $shape = if ($script:UseSelect) { '$select on' } else { 'full sign-in records' }
+        Write-Host "Query  : $mode, $shape" -ForegroundColor Cyan
+
+        foreach ($slice in $script:PendingSlices) {
+            $slice.Uri = New-SignInUri -Filter (Get-SliceFilter $slice)
+            $script:Waiting.Enqueue($slice)
+        }
+
+        Invoke-SignInDownload
+    }
+
+    if (-not $script:WarnedCa -and -not $script:SawPolicies -and ($script:TotalScanned + $script:ResumedScanned) -gt 0 -and $script:CheckedVisibility -gt 0) {
+        Write-Warning 'appliedConditionalAccessPolicies was empty on every sign-in read during this run.'
+        Write-Warning 'The account may read sign-ins but lack a role that can read Conditional Access data.'
+    }
+
+    $averageLatency = if ($script:LatencyCount -gt 0) {
+        $script:LatencyTotal / $script:LatencyCount
+    }
+    else {
+        0
     }
 
     Write-Host (
-        "`rslice {0,-3} {1} scanned {2,-9} matched {3,-6} [{4}%] ETA {5:hh\:mm\:ss}        " -f
-        $slice.Index,
-        $slice.From.Substring(0, 13),
-        $scanned,
-        $matched,
-        $percent,
-        $eta
-    ) -ForegroundColor Gray
-}
+        "`nRequests: {0} | Throttled: {1} | Pace: {2:N2}s | Avg latency: {3:N2}s" -f
+        $script:Requests,
+        $script:Throttles,
+        $script:IntervalSeconds,
+        $averageLatency
+    ) -ForegroundColor DarkCyan
 
-$stopwatch.Stop()
-#endregion
+    if ($Diagnose -and $script:ResultTally.Count -gt 0) {
+        Write-Host "`n--- Report-only results observed during this run ---" -ForegroundColor Magenta
+        $script:ResultTally.GetEnumerator() |
+            Sort-Object Value -Descending |
+            Select-Object `
+                @{ Name = 'Policy | Result'; Expression = { $_.Key } },
+                @{ Name = 'Count'; Expression = { $_.Value } } |
+            Format-Table -AutoSize
+    }
 
-#region ---------- Diagnose ----------
-Write-Host (
-    "`nRequests: {0} | Throttled: {1} | Final pace: {2:N2}s/request" -f
-    $script:Requests,
-    $script:Throttles,
-    $script:MinInterval
-) -ForegroundColor DarkCyan
+    $merged = Merge-PartFiles -Destination $outFullPath
+    $script:Stopwatch.Stop()
 
-if ($Diagnose -and $resultTally.Count) {
-    Write-Host "`n--- Report-only results observed during this run ---" -ForegroundColor Magenta
-    $resultTally.GetEnumerator() |
-        Sort-Object Value -Descending |
-        Select-Object `
-            @{ Name = 'Policy | Result'; Expression = { $_.Key } },
-            @{ Name = 'Count'; Expression = { $_.Value } } |
-        Format-Table -AutoSize
-}
-#endregion
+    if (-not $merged) {
+        Write-Warning "Scanned $($script:TotalScanned) sign-ins during this run and found no completed part files containing matches."
+        Write-Warning 'Run a shorter window with -Diagnose to see which report-only results are present.'
+        return
+    }
 
-#region ---------- Merge without importing or sorting all rows ----------
-$parts = @(
-    Get-ChildItem -LiteralPath $PartDir -Filter 'part_*.csv' -File -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path -LiteralPath "$($_.FullName).done" } |
-        Sort-Object Name
-)
+    Write-Host "`nDone in $($script:Stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+    Write-Host "Scanned this run : $($script:TotalScanned)" -ForegroundColor Green
+    Write-Host "Matched this run : $($script:TotalMatched)" -ForegroundColor Green
+    if ($Resume) {
+        Write-Host "Scanned resumed  : $($script:ResumedScanned)" -ForegroundColor Green
+        Write-Host "Matched resumed  : $($script:ResumedMatched)" -ForegroundColor Green
+    }
 
-if ($parts.Count -eq 0) {
-    Write-Warning "Scanned $totalScanned sign-ins during this run and found no completed part files containing matches."
-    Write-Warning 'Rerun a smaller window with -Diagnose to see which report-only results are present.'
-    return
-}
+    Write-Host "CSV              : $outFullPath" -ForegroundColor Green
+    Write-Host "Parts            : $PartDir" -ForegroundColor DarkGray
 
-$writer = [IO.StreamWriter]::new(
-    $outFullPath,
-    $false,
-    [Text.UTF8Encoding]::new($true)
-)
-
-try {
-    $headerWritten = $false
-
-    foreach ($part in $parts) {
-        $reader = [IO.StreamReader]::new($part.FullName)
-        try {
-            $header = $reader.ReadLine()
-
-            if (-not $headerWritten -and $header) {
-                $writer.WriteLine($header)
-                $headerWritten = $true
-            }
-
-            while (-not $reader.EndOfStream) {
-                $writer.WriteLine($reader.ReadLine())
-            }
-        }
-        finally {
-            $reader.Dispose()
-        }
+    $rollups = @([SignInPageReader]::Summarize($outFullPath) | Where-Object { $null -ne $_ })
+    if ($rollups.Count -gt 0) {
+        $rollups |
+            Sort-Object Events -Descending |
+            Format-Table Policy, Events, UniqueUsers -AutoSize
     }
 }
-finally {
-    $writer.Dispose()
+catch {
+    try {
+        $script:Cancel.Cancel()
+    }
+    catch {
+    }
+
+    foreach ($job in @($script:InFlight)) {
+        try {
+            [void]$job.Task.Wait(3000)
+        }
+        catch {
+        }
+
+        try {
+            $job.Request.Dispose()
+        }
+        catch {
+        }
+
+        if ($job.Task.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion) {
+            try {
+                $job.Task.Result.Dispose()
+            }
+            catch {
+            }
+        }
+    }
+
+    foreach ($slice in @($script:AllSlices)) {
+        Clear-IncompleteSlice $slice
+    }
+
+    throw
 }
-
-Write-Host "`nDone in $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
-Write-Host "Scanned this run : $totalScanned" -ForegroundColor Green
-Write-Host "Matched this run : $totalMatched" -ForegroundColor Green
-Write-Host "CSV              : $outFullPath" -ForegroundColor Green
-Write-Host "Parts            : $PartDir" -ForegroundColor DarkGray
-
-# This summary is intentionally performed after the export. Group-Object retains
-# matching rows by policy; remove this block if final-report memory usage matters
-# more than the console summary.
-Import-Csv -LiteralPath $outFullPath |
-    Group-Object PolicyName |
-    Sort-Object Count -Descending |
-    Select-Object `
-        @{ Name = 'Policy'; Expression = { $_.Name } },
-        @{ Name = 'Events'; Expression = { $_.Count } },
-        @{ Name = 'UniqueUsers'; Expression = {
-            @($_.Group.User | Select-Object -Unique).Count
-        } } |
-    Format-Table -AutoSize
-#endregion
+finally {
+    if ($script:Http) {
+        $script:Http.Dispose()
+    }
+}
