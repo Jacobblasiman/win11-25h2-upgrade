@@ -6,10 +6,10 @@
 
 .DESCRIPTION
     Reads https://graph.microsoft.com/v1.0/auditLogs/signIns, the same sign-in
-    report the Entra portal uses. Report-only policy results are not a
-    documented server-side filter, so the script asks Graph to apply that
-    filter and, if Graph rejects it, downloads each sign-in in the window and
-    matches locally.
+    report the Entra portal uses. Every sign-in in the window is downloaded.
+    -Results, -PolicyId, and -PolicyName are applied while each page is read.
+    Graph accepts a policy filter and then returns an empty page, so that
+    filter is not sent.
 
     The Identity and Access Reports service allows 5 requests per 10 seconds
     for each app in a tenant. Several time slices stay in flight so a slow
@@ -480,7 +480,7 @@ function ConvertTo-GraphUtc {
     # Quote the separators. Unquoted ':' follows the current culture and is
     # '.' on macOS systems that use a Finnish or Italian locale.
     return $Value.ToString(
-        "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+        "yyyy-MM-dd'T'HH:mm:ss'Z'",
         [Globalization.CultureInfo]::InvariantCulture
     )
 }
@@ -498,69 +498,14 @@ function Resolve-UserPath {
     return [IO.Path]::GetFullPath($Path)
 }
 
-function Get-PolicyClause {
-    # Full asks Graph to return only sign-ins whose applied policy result is one
-    # of -Results. That predicate is not documented; IdOnly is. Off downloads
-    # the window and matches locally. Client matching always still runs.
-    if ($script:ServerFilterMode -eq 'Off') {
-        return $null
-    }
-
-    if ($script:ServerFilterMode -eq 'IdOnly') {
-        if (-not $script:PolicyGuid) {
-            return $null
-        }
-
-        return "appliedConditionalAccessPolicies/any(p:p/id eq '$($script:PolicyGuid)')"
-    }
-
-    $resultParts = @(
-        foreach ($result in $Results) {
-            "p/result eq '$result'"
-        }
-    )
-
-    $resultExpr = if ($resultParts.Count -eq 1) {
-        $resultParts[0]
-    }
-    else {
-        '(' + ($resultParts -join ' or ') + ')'
-    }
-
-    if ($script:PolicyGuid) {
-        return "appliedConditionalAccessPolicies/any(p:p/id eq '$($script:PolicyGuid)' and $resultExpr)"
-    }
-
-    return "appliedConditionalAccessPolicies/any(p:$resultExpr)"
-}
-
-function Disable-ServerFilter {
-    if ($script:ServerFilterMode -eq 'Full' -and $script:PolicyGuid) {
-        $script:ServerFilterMode = 'IdOnly'
-        Write-Warning 'Graph rejected filtering on report-only results. Retrying with the policy id only.'
-        return $true
-    }
-
-    if ($script:ServerFilterMode -ne 'Off') {
-        $script:ServerFilterMode = 'Off'
-        Write-Warning 'Graph rejected the server-side Conditional Access filter. Every sign-in in the window will be downloaded and matched locally.'
-        return $true
-    }
-
-    return $false
-}
-
 function Get-SliceFilter {
     param($Slice)
 
+    # Date window only. A filter on appliedConditionalAccessPolicies returns
+    # HTTP 200 with an empty page, which makes the scan count stay at 0.
     $filter = 'createdDateTime ge {0} and createdDateTime lt {1}' -f $Slice.From, $Slice.To
     if ($InteractiveOnly) {
         $filter += ' and isInteractive eq true'
-    }
-
-    $clause = Get-PolicyClause
-    if ($clause) {
-        $filter += ' and ' + $clause
     }
 
     return $filter
@@ -588,21 +533,12 @@ function Update-QueryMode {
         return $false
     }
 
-    $filterHit = $Body -match '(?i)filter|appliedConditionalAccess'
     $selectHit = $Body -match '(?i)\$select|\bselect\b'
 
-    if ($script:ServerFilterMode -ne 'Off' -and $filterHit -and -not $selectHit) {
-        return (Disable-ServerFilter)
-    }
-
-    if ($script:UseSelect -and $selectHit -and -not $filterHit) {
+    if ($script:UseSelect -and ($selectHit -or $Body -match '(?i)filter|invalid')) {
         $script:UseSelect = $false
         Write-Warning 'Graph rejected $select. Downloading full sign-in records.'
         return $true
-    }
-
-    if ($script:ServerFilterMode -ne 'Off') {
-        return (Disable-ServerFilter)
     }
 
     if ($script:UseSelect) {
@@ -1455,7 +1391,7 @@ function Invoke-SelfTest {
         [Threading.Thread]::CurrentThread.CurrentCulture = $custom
         $moment = [DateTime]::new(2026, 11, 23, 15, 4, 5, 123, [DateTimeKind]::Utc).AddTicks(4560)
         $formatted = ConvertTo-GraphUtc $moment
-        if ($formatted -cne '2026-11-23T15:04:05.1234560Z') {
+        if ($formatted -cne '2026-11-23T15:04:05Z') {
             throw "UTC format changed under a non-colon time separator: $formatted"
         }
     }
@@ -1656,13 +1592,7 @@ if ($SelfTest) {
 
 $script:SelectList = 'id,createdDateTime,userPrincipalName,userDisplayName,appDisplayName,resourceDisplayName,clientAppUsed,isInteractive,appliedConditionalAccessPolicies,ipAddress,location,deviceDetail,status,correlationId'
 $script:UseSelect = $true
-$script:ServerFilterMode = 'Full'
 $script:QueryModeLocked = $false
-$script:PolicyGuid = ''
-$parsedGuid = [guid]::Empty
-if ($PolicyId -and [guid]::TryParse($PolicyId, [ref]$parsedGuid)) {
-    $script:PolicyGuid = $parsedGuid.ToString('D')
-}
 
 $script:ResultSet = [System.Collections.Generic.HashSet[string]]::new(
     [StringComparer]::OrdinalIgnoreCase
@@ -1870,14 +1800,8 @@ try {
     }
     else {
         Invoke-QueryProbe
-        $mode = switch ($script:ServerFilterMode) {
-            'Full' { 'server-side report-only filter' }
-            'IdOnly' { 'server-side policy id filter' }
-            default { 'local match across every sign-in' }
-        }
-
-        $shape = if ($script:UseSelect) { '$select on' } else { 'full sign-in records' }
-        Write-Host "Query  : $mode, $shape" -ForegroundColor Cyan
+        $shape = if ($script:UseSelect) { 'selected columns' } else { 'full sign-in records' }
+        Write-Host "Query  : every sign-in in the window, matched locally, $shape" -ForegroundColor Cyan
 
         foreach ($slice in $script:PendingSlices) {
             $slice.Uri = New-SignInUri -Filter (Get-SliceFilter $slice)
